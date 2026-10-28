@@ -2,8 +2,10 @@ import base64
 import json
 import logging
 from datetime import datetime, timezone
+from time import perf_counter
 
 from app.agent.nodes import scheduler_node, stream_draft_reply
+from app.agent.graph import triage_graph
 from app.agent.state import EmailAgentState
 from app.api.schemas import (
     CalendarApprovalRequest,
@@ -38,10 +40,13 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from googleapiclient.errors import HttpError
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, func, or_
+from sqlalchemy.orm import Session, contains_eager, joinedload, load_only
 
 logger = logging.getLogger(__name__)
+
+VALID_CATEGORIES = ("MEETING_REQUEST", "ACTION_REQUIRED", "INFORMATIONAL", "SPAM")
+VALID_PRIORITIES = ("HIGH", "MEDIUM", "LOW")
 
 router = APIRouter()
 action_router = APIRouter()
@@ -83,11 +88,16 @@ def _get_email_action_state(
 
 
 def _resolve_user_account(
-    access_token: str, db: Session, create: bool = False
+    access_token: str,
+    db: Session,
+    create: bool = False,
+    timing_context: str | None = None,
 ) -> tuple[UserAccount, str]:
     try:
+        google_profile_started = perf_counter()
         service, active_token = get_gmail_service_from_token(access_token)
         profile = service.users().getProfile(userId="me").execute()
+        google_profile_ms = (perf_counter() - google_profile_started) * 1000
     except HttpError as error:
         status = getattr(getattr(error, "resp", None), "status", None)
         logger.info("Google rejected Gmail authentication with status %s", status)
@@ -102,11 +112,20 @@ def _resolve_user_account(
             status_code=401, detail="Google did not return a Gmail account."
         )
 
+    account_lookup_started = perf_counter()
     user = (
         db.query(UserAccount)
         .filter(func.lower(UserAccount.email) == user_email.lower())
         .first()
     )
+    account_lookup_ms = (perf_counter() - account_lookup_started) * 1000
+    if timing_context:
+        logger.info(
+            "%s_auth_timing google_profile_ms=%.1f account_lookup_ms=%.1f",
+            timing_context,
+            google_profile_ms,
+            account_lookup_ms,
+        )
     if user is None:
         if not create:
             raise HTTPException(status_code=404, detail="Gmail account not found.")
@@ -185,8 +204,8 @@ def _store_email_if_new(
     db.add(
         EmailAgentStateModel(
             email_id=email_data["id"],
-            category="UNCATEGORIZED",
-            priority="NORMAL",
+            category=None,
+            priority=None,
             is_archived=False,
         )
     )
@@ -206,6 +225,94 @@ def _build_action_state(email: Email) -> EmailAgentState:
         "calendar_event": None,
         "is_archived": False,
     }
+
+
+def tag_recent_untagged_emails(user_id: str, limit: int = 10) -> None:
+    """Tag up to limit recent untagged emails belonging to one user."""
+    logger.info("Starting background tagging for user_id=%s limit=%s", user_id, limit)
+    db: Session = SessionLocal()
+    attempted_ids: set[str] = set()
+    processed = 0
+    updated = 0
+    try:
+        while processed < limit:
+            needs_tagging = or_(
+                Email.category.is_(None),
+                Email.priority.is_(None),
+                Email.category.notin_(VALID_CATEGORIES),
+                Email.priority.notin_(VALID_PRIORITIES),
+                EmailAgentStateModel.category.is_(None),
+                EmailAgentStateModel.priority.is_(None),
+                EmailAgentStateModel.category.notin_(VALID_CATEGORIES),
+                EmailAgentStateModel.priority.notin_(VALID_PRIORITIES),
+            )
+            email = (
+                db.query(Email)
+                .outerjoin(Email.state)
+                .filter(
+                    Email.user_id == user_id,
+                    needs_tagging,
+                    ~Email.id.in_(attempted_ids) if attempted_ids else True,
+                )
+                .order_by(Email.created_at.desc())
+                .with_for_update(skip_locked=True, of=Email)
+                .first()
+            )
+            if email is None:
+                break
+
+            processed += 1
+            attempted_ids.add(email.id)
+            email_id = email.id
+            logger.info(
+                "Tagging email_id=%s for user_id=%s (%s/%s)",
+                email_id,
+                user_id,
+                processed,
+                limit,
+            )
+            try:
+                result = triage_graph.invoke(_build_action_state(email))
+                category = result.get("category")
+                priority = result.get("priority")
+                if category not in VALID_CATEGORIES or priority not in VALID_PRIORITIES:
+                    raise ValueError("Triage returned an invalid category or priority")
+
+                state = email.state
+                if state is None:
+                    state = EmailAgentStateModel(email_id=email.id)
+                    db.add(state)
+
+                is_archived = bool(result.get("is_archived", False))
+                email.category = category
+                email.priority = priority
+                email.is_archived = is_archived
+                state.category = category
+                state.priority = priority
+                state.is_archived = is_archived
+                db.commit()
+                updated += 1
+                logger.info(
+                    "Tagging succeeded for email_id=%s: category=%s priority=%s is_archived=%s",
+                    email_id,
+                    category,
+                    priority,
+                    is_archived,
+                )
+            except Exception:
+                db.rollback()
+                logger.exception("Failed to tag email_id=%s for user_id=%s", email_id, user_id)
+    except Exception:
+        db.rollback()
+        logger.exception("Failed selecting untagged emails for user_id=%s", user_id)
+    finally:
+        logger.info(
+            "Background tagging complete for user_id=%s processed=%s updated=%s",
+            user_id,
+            processed,
+            updated,
+        )
+        db.close()
 
 
 # =========================================================================
@@ -245,10 +352,11 @@ def register_watch(
 
 @router.post("/emails/sync-initial", response_model=InitialSyncResponse)
 def sync_initial_emails(
+    background_tasks: BackgroundTasks,
     authorization: str = Header(...),
     db: Session = Depends(get_db),
 ):
-    """Imports the last seven days once, then applies Gmail changes since the watch cursor."""
+    """Imports the last three days once, then applies Gmail changes since the watch cursor."""
     token = _get_bearer_token(authorization)
 
     try:
@@ -294,7 +402,7 @@ def sync_initial_emails(
 
         listed_ids, active_token = list_message_ids(
             access_token=active_token,
-            query="newer_than:7d",
+            query="in:inbox newer_than:3d",
             refresh_token=user.refresh_token,
         )
         changed_ids, latest_history_id, active_token = (
@@ -331,6 +439,7 @@ def sync_initial_emails(
         )
         user.initial_sync_completed_at = datetime.now(timezone.utc)
         db.commit()
+        background_tasks.add_task(tag_recent_untagged_emails, user.id)
         return InitialSyncResponse(
             status="completed",
             imported_count=imported_count,
@@ -390,6 +499,7 @@ def process_realtime_email_update(email_address: str, pushed_history_id: str):
             _store_email_if_new(db, user, email_data)
 
         db.commit()
+        tag_recent_untagged_emails(user.id)
         logger.info(
             "Ingested %d new email(s) for %s up to historyId %s",
             len(new_ids),
@@ -439,6 +549,25 @@ def get_emails(
     db.commit()
     emails = (
         db.query(Email)
+        .options(
+            load_only(
+                Email.id,
+                Email.thread_id,
+                Email.user_id,
+                Email.sender,
+                Email.subject,
+                Email.preview,
+                Email.category,
+                Email.priority,
+                Email.is_archived,
+                Email.created_at,
+            ),
+            joinedload(Email.state).load_only(
+                EmailAgentStateModel.category,
+                EmailAgentStateModel.priority,
+                EmailAgentStateModel.is_archived,
+            ),
+        )
         .filter(Email.user_id == user.id)
         .order_by(Email.created_at.desc())
         .all()
@@ -453,22 +582,16 @@ def get_emails(
             "subject": e.subject,
             "preview": e.preview or "",
             "received_at": e.created_at.isoformat() if e.created_at else None,
-            "category": e.state.category if e.state else "UNCATEGORIZED",
-            "priority": e.state.priority if e.state else "NORMAL",
-            "is_archived": e.state.is_archived if e.state else False,
-            "reply_outline": e.state.reply_outline if e.state else [],
-            "suggested_reply": e.state.suggested_reply if e.state else "",
-            "calendar_event": (
-                {
-                    "draft_id": str(e.calendar_draft.id),
-                    "title": e.calendar_draft.title,
-                    "start_time": e.calendar_draft.start_time,
-                    "end_time": e.calendar_draft.end_time,
-                    "status": e.calendar_draft.status,
-                    "attendees": e.calendar_draft.attendees or [],
-                }
-                if e.calendar_draft
-                else None
+            "category": (
+                e.state.category if e.state else e.category
+            ),
+            "priority": (
+                e.state.priority if e.state else e.priority
+            ),
+            "is_archived": (
+                e.state.is_archived
+                if e.state and e.state.is_archived is not None
+                else bool(e.is_archived)
             ),
         })
 
@@ -481,12 +604,25 @@ def get_email_body(
     authorization: str = Header(...),
     db: Session = Depends(get_db),
 ):
-    user, _ = _resolve_user_account(_get_bearer_token(authorization), db)
+    request_started = perf_counter()
+    auth_started = perf_counter()
+    user, _ = _resolve_user_account(
+        _get_bearer_token(authorization), db, timing_context="email_body"
+    )
+    auth_ms = (perf_counter() - auth_started) * 1000
+    database_started = perf_counter()
     db.commit()
     email = (
         db.query(Email)
         .filter(Email.id == email_id, Email.user_id == user.id)
         .first()
+    )
+    database_ms = (perf_counter() - database_started) * 1000
+    logger.info(
+        "email_body_request_timing auth_ms=%.1f database_ms=%.1f total_ms=%.1f",
+        auth_ms,
+        database_ms,
+        (perf_counter() - request_started) * 1000,
     )
     if not email:
         raise HTTPException(status_code=404, detail="Email not found")
