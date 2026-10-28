@@ -34,3 +34,8 @@ pgdata/
 # OS Generated Files
 .DS_Store
 Thumbs.db
+
+
+plan.txt
+reset.*
+terminal.txt

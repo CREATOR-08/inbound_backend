@@ -1,0 +1,347 @@
+import base64
+import html
+import logging
+import os
+import re
+from datetime import datetime, timezone
+from email.message import EmailMessage
+from email.utils import parseaddr, parsedate_to_datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+
+logger = logging.getLogger(__name__)
+
+GMAIL_PUBSUB_TOPIC = os.getenv(
+    "GMAIL_PUBSUB_TOPIC", "projects/inbound-511714/topics/gmail-notifications"
+)
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+
+
+def get_gmail_service_from_token(
+    access_token: str, refresh_token: Optional[str] = None
+) -> Tuple[Any, str]:
+    """Builds a Gmail API client dynamically using the OAuth token.
+
+    Automatically refreshes expired access tokens if a refresh token is
+    available. Returns (service, valid_access_token).
+    """
+    creds = Credentials(
+        token=access_token,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+    )
+
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except Exception:
+            logger.exception("Failed to refresh Google OAuth access token")
+            raise
+
+    service = build("gmail", "v1", credentials=creds)
+    return service, creds.token or access_token
+
+
+def _decode_base64_payload(data: str) -> str:
+    """Safely decodes Gmail URL-safe base64 data to UTF-8 text."""
+    if not data:
+        return ""
+    try:
+        padded_data = data + "=" * (-len(data) % 4)
+        return base64.urlsafe_b64decode(padded_data.encode("ASCII")).decode(
+            "utf-8", errors="replace"
+        )
+    except Exception:
+        return ""
+
+
+def clean_text_for_llm(raw_text: str) -> str:
+    """Strips massive URLs, footers, and redundant lines to preserve LLM context window."""
+    if not raw_text:
+        return ""
+
+    text = raw_text
+    footer_delimiters = [
+        "----------------------------------------",
+        "This email was intended for",
+        "You are receiving",
+        "Unsubscribe:",
+        "© 202",
+    ]
+    for delimiter in footer_delimiters:
+        if delimiter in text:
+            text = text.split(delimiter)[0]
+
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+
+def _extract_bodies_from_payload(payload: Dict[str, Any]) -> Tuple[str, str]:
+    """Recursively traverses the MIME structure to extract both plain text and HTML bodies."""
+    plain_parts: List[str] = []
+    html_parts: List[str] = []
+
+    def walk_parts(part: Dict[str, Any]):
+        mime_type = part.get("mimeType", "")
+        body_data = part.get("body", {}).get("data", "")
+
+        if body_data:
+            decoded = _decode_base64_payload(body_data)
+            if mime_type == "text/plain":
+                plain_parts.append(decoded)
+            elif mime_type == "text/html":
+                html_parts.append(decoded)
+
+        for sub_part in part.get("parts", []):
+            walk_parts(sub_part)
+
+    walk_parts(payload)
+
+    body_plain = "\n".join(plain_parts).strip()
+    body_html = "\n".join(html_parts).strip()
+
+    if not body_html and body_plain:
+        body_html = (
+            "<pre style='white-space: pre-wrap; font-family: inherit;'>"
+            f"{html.escape(body_plain)}</pre>"
+        )
+    if not body_plain and body_html:
+        clean_tags = re.sub(r"<[^>]+>", " ", body_html)
+        body_plain = re.sub(r"\s+", " ", clean_tags).strip()
+
+    return body_plain, body_html
+
+
+# =========================================================================
+# Real-Time Pub/Sub & Delta Sync Helpers
+# =========================================================================
+
+
+def start_gmail_watch(
+    access_token: str,
+    refresh_token: Optional[str] = None,
+    topic_name: str = GMAIL_PUBSUB_TOPIC,
+) -> Dict[str, Any]:
+    """Registers Gmail to push INBOX updates to the Cloud Pub/Sub topic."""
+    service, _ = get_gmail_service_from_token(access_token, refresh_token)
+    body = {
+        "labelIds": ["INBOX"],
+        "topicName": topic_name,
+    }
+    return service.users().watch(userId="me", body=body).execute()
+
+
+def stop_gmail_watch(
+    access_token: str, refresh_token: Optional[str] = None
+) -> None:
+    """Stops Gmail push notifications for the authenticated mailbox."""
+    service, _ = get_gmail_service_from_token(access_token, refresh_token)
+    service.users().stop(userId="me").execute()
+
+
+def fetch_new_message_ids_from_history(
+    access_token: str,
+    start_history_id: str,
+    refresh_token: Optional[str] = None,
+    raise_on_expired: bool = False,
+) -> Tuple[List[str], str, str]:
+    """Queries Gmail History API for all messages added to INBOX since start_history_id.
+
+    Returns: (new_message_ids, latest_history_id, active_token)
+    """
+    service, active_token = get_gmail_service_from_token(
+        access_token, refresh_token
+    )
+    new_ids: set[str] = set()
+    latest_history_id = start_history_id
+    page_token = None
+
+    try:
+        while True:
+            resp = (
+                service.users()
+                .history()
+                .list(
+                    userId="me",
+                    startHistoryId=start_history_id,
+                    historyTypes=["messageAdded"],
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+
+            latest_history_id = resp.get("historyId", latest_history_id)
+
+            for record in resp.get("history", []):
+                for added in record.get("messagesAdded", []):
+                    msg = added.get("message", {})
+                    if "INBOX" in msg.get("labelIds", []):
+                        new_ids.add(msg["id"])
+
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+    except Exception as e:
+        # History IDs expire after ~1-4 weeks; 404 indicates history window lapsed
+        if "History id not found" in str(e) or "404" in str(e):
+            logger.warning(
+                "History ID %s expired. Returning empty set.", start_history_id
+            )
+            if raise_on_expired:
+                raise RuntimeError(
+                    f"Gmail history cursor {start_history_id} expired"
+                ) from e
+            return [], start_history_id, active_token
+        raise
+
+    return list(new_ids), str(latest_history_id), active_token
+
+
+def list_message_ids(
+    access_token: str,
+    query: str,
+    refresh_token: Optional[str] = None,
+) -> Tuple[List[str], str]:
+    """Lists every Gmail message matching a query, following all result pages."""
+    service, active_token = get_gmail_service_from_token(
+        access_token, refresh_token
+    )
+    message_ids: List[str] = []
+    page_token = None
+
+    while True:
+        response = (
+            service.users()
+            .messages()
+            .list(
+                userId="me",
+                q=query,
+                maxResults=500,
+                pageToken=page_token,
+            )
+            .execute()
+        )
+        message_ids.extend(
+            message["id"]
+            for message in response.get("messages", [])
+            if message.get("id")
+        )
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    return list(dict.fromkeys(message_ids)), active_token
+
+
+def fetch_single_email(
+    access_token: str, message_id: str, refresh_token: Optional[str] = None
+) -> Dict[str, Any]:
+    """Fetches full payload, headers, and parsed body content for a single message."""
+    service, active_token = get_gmail_service_from_token(
+        access_token, refresh_token
+    )
+    message = (
+        service.users()
+        .messages()
+        .get(userId="me", id=message_id, format="full")
+        .execute()
+    )
+
+    payload = message.get("payload", {})
+    headers = {
+        h["name"].lower(): h["value"] for h in payload.get("headers", [])
+    }
+
+    body_plain, body_html = _extract_bodies_from_payload(payload)
+    body_plain = body_plain or message.get("snippet", "")
+
+    received_at = None
+    if message.get("internalDate"):
+        received_at = datetime.fromtimestamp(
+            int(message["internalDate"]) / 1000, tz=timezone.utc
+        )
+    elif headers.get("date"):
+        try:
+            received_at = parsedate_to_datetime(headers["date"])
+        except (TypeError, ValueError, OverflowError):
+            received_at = datetime.now(timezone.utc)
+
+    return {
+        "id": message["id"],
+        "thread_id": message.get("threadId", message["id"]),
+        "sender": headers.get("from", "Unknown"),
+        "subject": headers.get("subject", "(No Subject)"),
+        "preview": message.get("snippet", ""),
+        "body": body_plain,
+        "body_html": body_html,
+        "has_html": bool(body_html),
+        "received_at": received_at,
+        "access_token": active_token,
+    }
+
+
+# =========================================================================
+# Reply Operations
+# =========================================================================
+
+
+def send_email_reply(
+    access_token: str,
+    email_id: str,
+    thread_id: str,
+    sender: str,
+    subject: str,
+    body: str,
+    refresh_token: Optional[str] = None,
+) -> str:
+    """Send a reply through Gmail and return the created message ID."""
+    recipient = parseaddr(sender)[1]
+    if not recipient or "@" not in recipient:
+        raise ValueError("The sender address is not a valid reply recipient")
+    if not body.strip():
+        raise ValueError("Reply body cannot be empty")
+
+    service, _ = get_gmail_service_from_token(access_token, refresh_token)
+    original = (
+        service.users()
+        .messages()
+        .get(
+            userId="me",
+            id=email_id,
+            format="metadata",
+            metadataHeaders=["Message-ID", "References"],
+        )
+        .execute()
+    )
+    headers = {
+        h["name"].lower(): h["value"]
+        for h in original.get("payload", {}).get("headers", [])
+    }
+    message_id = headers.get("message-id")
+
+    message = EmailMessage()
+    message["To"] = recipient
+    message["Subject"] = (
+        subject if subject.lower().startswith("re:") else f"Re: {subject}"
+    )
+    if message_id:
+        message["In-Reply-To"] = message_id
+        references = headers.get("references", "")
+        message["References"] = f"{references} {message_id}".strip()
+    message.set_content(body)
+
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+    sent = (
+        service.users()
+        .messages()
+        .send(userId="me", body={"raw": raw, "threadId": thread_id})
+        .execute()
+    )
+    return sent["id"]

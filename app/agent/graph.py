@@ -1,45 +1,16 @@
 from langgraph.graph import StateGraph, END
 from app.agent.state import EmailAgentState
-from app.agent.nodes import triage_node, drafter_node, scheduler_node
-
-def route_triage(state: EmailAgentState) -> str:
-    if state.get("is_archived"):
-        return END
-    if state.get("category") == "MEETING_REQUEST":
-        return "scheduler_node"
-    return "drafter_node"
+from app.agent.nodes import triage_node
 
 # 1. Initialize StateGraph
 builder = StateGraph(EmailAgentState)
 
-# 2. Add Nodes
+# Ingestion deliberately ends after triage. Reply and calendar generation are
+# separate actions initiated by the user.
 builder.add_node("triage_node", triage_node)
-builder.add_node("scheduler_node", scheduler_node)
-builder.add_node("drafter_node", drafter_node)
-
-# 3. Define Entrypoint and Edges
 builder.set_entry_point("triage_node")
-
-# Conditional routing out of triage
-builder.add_conditional_edges(
-    "triage_node",
-    route_triage,
-    {
-        END: END,
-        "scheduler_node": "scheduler_node",
-        "drafter_node": "drafter_node"
-    }
-)
-
-# If meeting was extracted, move on to drafting the response
-builder.add_edge("scheduler_node", "drafter_node")
-builder.add_edge("drafter_node", END)
-
-# 4. Compile workflow
-email_graph = builder.compile()
-
-
-
+builder.add_edge("triage_node", END)
+triage_graph = builder.compile()
 
 if __name__ == "__main__":
     mock_email: EmailAgentState = {
@@ -55,6 +26,6 @@ if __name__ == "__main__":
         "is_archived": False
     }
 
-    result = email_graph.invoke(mock_email)
+    result = triage_graph.invoke(mock_email)
     import json
     print(json.dumps(result, indent=2))
