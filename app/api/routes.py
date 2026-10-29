@@ -7,7 +7,7 @@ from time import perf_counter
 from app.agent.nodes import scheduler_node, stream_draft_reply
 from app.agent.graph import triage_graph
 from app.agent.state import EmailAgentState
-from app.api.schemas import (
+from app.api.schemas.schemas import (
     CalendarApprovalRequest,
     EmailActionRequest,
     EmailSendRequest,
