@@ -1,36 +1,25 @@
-from typing import Any, Literal
+"""Compatibility exports for the assistant's public Pydantic schemas."""
 
-from pydantic import BaseModel, Field
+from app.api.schemas.assistant import (
+    AssistantCommandRequest,
+    AssistantIntent,
+    AssistantResponse,
+    EmailQueryResult,
+    EmailQuerySpec,
+    PlannedUIAction,
+)
 
+AssistantRequest = AssistantCommandRequest
+Intent = AssistantIntent
+UIAction = PlannedUIAction
 
-Intent = Literal[
-    "UI_ACTION",
-    "QUESTION",
-    "WORKFLOW",
-    "CLARIFICATION",
+__all__ = [
+    "AssistantCommandRequest",
+    "AssistantIntent",
+    "AssistantRequest",
+    "AssistantResponse",
+    "EmailQueryResult",
+    "EmailQuerySpec",
+    "Intent",
+    "UIAction",
 ]
-
-
-class AssistantRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=4000)
-    session_id: str = Field(min_length=1, max_length=200)
-
-
-class UIAction(BaseModel):
-    type: Literal[
-        "navigate",
-        "filter_emails",
-        "search_emails",
-        "open_email",
-        "show_email_summary",
-        "compose_email",
-        "draft_reply",
-    ]
-
-    parameters: dict[str, Any] = Field(default_factory=dict)
-
-
-class AssistantResponse(BaseModel):
-    message: str
-    actions: list[UIAction] = Field(default_factory=list)
-    requires_clarification: bool = False

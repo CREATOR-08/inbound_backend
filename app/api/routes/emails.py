@@ -31,6 +31,7 @@ from app.services.gmail import (
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, or_
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.orm import Session, joinedload, load_only
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,41 @@ def _latest_history_id(*history_ids: str | None) -> str | None:
 def _store_email_if_new(
     db: Session, user: UserAccount, email_data: dict
 ) -> bool:
+    email_values = {
+        "id": email_data["id"],
+        "thread_id": email_data["thread_id"],
+        "user_id": user.id,
+        "sender": email_data["sender"],
+        "subject": email_data["subject"],
+        "preview": email_data["preview"],
+        "body": email_data["body"],
+        "body_html": email_data["body_html"],
+        "has_html": email_data["has_html"],
+        "created_at": email_data["received_at"],
+    }
+    if db.get_bind().dialect.name == "postgresql":
+        inserted = db.execute(
+            postgresql_insert(Email)
+            .values(**email_values)
+            .on_conflict_do_nothing(index_elements=[Email.id])
+        )
+        if not inserted.rowcount:
+            existing = db.query(Email).filter(Email.id == email_data["id"]).first()
+            if existing and existing.user_id != user.id:
+                logger.error(
+                    "Gmail message ID collision across accounts; refusing to reassign it"
+                )
+            return False
+        db.add(
+            EmailAgentStateModel(
+                email_id=email_data["id"],
+                category=None,
+                priority=None,
+                is_archived=False,
+            )
+        )
+        return True
+
     existing = db.query(Email).filter(Email.id == email_data["id"]).first()
     if existing:
         if existing.user_id != user.id:
@@ -84,20 +120,7 @@ def _store_email_if_new(
             )
         return False
 
-    db.add(
-        Email(
-            id=email_data["id"],
-            thread_id=email_data["thread_id"],
-            user_id=user.id,
-            sender=email_data["sender"],
-            subject=email_data["subject"],
-            preview=email_data["preview"],
-            body=email_data["body"],
-            body_html=email_data["body_html"],
-            has_html=email_data["has_html"],
-            created_at=email_data["received_at"],
-        )
-    )
+    db.add(Email(**email_values))
     db.add(
         EmailAgentStateModel(
             email_id=email_data["id"],
@@ -110,14 +133,14 @@ def _store_email_if_new(
 
 
 def tag_recent_untagged_emails(user_id: str, limit: int = 10) -> None:
-    """Tag up to limit recent untagged emails belonging to one user."""
+    """Tag recent emails without keeping a session or lock during model inference."""
     logger.info("Starting background tagging for user_id=%s limit=%s", user_id, limit)
-    db: Session = SessionLocal()
     attempted_ids: set[str] = set()
     processed = 0
     updated = 0
-    try:
-        while processed < limit:
+    while processed < limit:
+        db: Session = SessionLocal()
+        try:
             needs_tagging = or_(
                 Email.category.is_(None),
                 Email.priority.is_(None),
@@ -137,64 +160,81 @@ def tag_recent_untagged_emails(user_id: str, limit: int = 10) -> None:
                     ~Email.id.in_(attempted_ids) if attempted_ids else True,
                 )
                 .order_by(Email.created_at.desc())
-                .with_for_update(skip_locked=True, of=Email)
                 .first()
             )
             if email is None:
-                break
+                email_id = None
+                action_state = None
+            else:
+                email_id = email.id
+                action_state = _build_action_state(email)
+                attempted_ids.add(email_id)
+        except Exception:
+            logger.exception("Failed selecting untagged emails for user_id=%s", user_id)
+            return
+        finally:
+            db.close()
 
-            processed += 1
-            attempted_ids.add(email.id)
-            email_id = email.id
-            logger.info(
-                "Tagging email_id=%s for user_id=%s (%s/%s)",
-                email_id,
-                user_id,
-                processed,
-                limit,
-            )
-            try:
-                result = triage_graph.invoke(_build_action_state(email))
-                category = result.get("category")
-                priority = result.get("priority")
-                if category not in VALID_CATEGORIES or priority not in VALID_PRIORITIES:
-                    raise ValueError("Triage returned an invalid category or priority")
-
-                state = email.state
-                if state is None:
-                    state = EmailAgentStateModel(email_id=email.id)
-                    db.add(state)
-
-                is_archived = bool(result.get("is_archived", False))
-                email.category = category
-                email.priority = priority
-                email.is_archived = is_archived
-                state.category = category
-                state.priority = priority
-                state.is_archived = is_archived
-                db.commit()
-                updated += 1
-                logger.info(
-                    "Tagging succeeded for email_id=%s: category=%s priority=%s is_archived=%s",
-                    email_id,
-                    category,
-                    priority,
-                    is_archived,
-                )
-            except Exception:
-                db.rollback()
-                logger.exception("Failed to tag email_id=%s for user_id=%s", email_id, user_id)
-    except Exception:
-        db.rollback()
-        logger.exception("Failed selecting untagged emails for user_id=%s", user_id)
-    finally:
+        if email_id is None or action_state is None:
+            break
+        processed += 1
         logger.info(
-            "Background tagging complete for user_id=%s processed=%s updated=%s",
+            "Tagging email_id=%s for user_id=%s (%s/%s)",
+            email_id,
             user_id,
             processed,
-            updated,
+            limit,
         )
-        db.close()
+        try:
+            result = triage_graph.invoke(action_state)
+            category = result.get("category")
+            priority = result.get("priority")
+            if category not in VALID_CATEGORIES or priority not in VALID_PRIORITIES:
+                raise ValueError("Triage returned an invalid category or priority")
+        except Exception:
+            logger.exception("Failed to tag email_id=%s for user_id=%s", email_id, user_id)
+            continue
+
+        db = SessionLocal()
+        try:
+            email = (
+                db.query(Email)
+                .filter(Email.id == email_id, Email.user_id == user_id)
+                .first()
+            )
+            if email is None:
+                continue
+            state = email.state
+            if state is None:
+                state = EmailAgentStateModel(email_id=email_id)
+                db.add(state)
+            is_archived = bool(result.get("is_archived", False))
+            email.category = category
+            email.priority = priority
+            email.is_archived = is_archived
+            state.category = category
+            state.priority = priority
+            state.is_archived = is_archived
+            db.commit()
+            updated += 1
+            logger.info(
+                "Tagging succeeded for email_id=%s: category=%s priority=%s is_archived=%s",
+                email_id,
+                category,
+                priority,
+                is_archived,
+            )
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to persist triage for email_id=%s", email_id)
+        finally:
+            db.close()
+    logger.info(
+        "Background tagging complete for user_id=%s processed=%s updated=%s",
+        user_id,
+        processed,
+        updated,
+    )
 
 
 @router.post("/emails/watch")
@@ -207,14 +247,27 @@ def register_watch(
 
     try:
         user, active_token = _resolve_user_account(token, db, create=True)
-        user = (
-            db.query(UserAccount)
-            .filter(UserAccount.id == user.id)
-            .with_for_update()
-            .one()
+        user_id = user.id
+        watch_user = UserAccount(
+            id=user_id,
+            refresh_token=user.refresh_token,
+            last_history_id=user.last_history_id,
+            watch_expiration=user.watch_expiration,
         )
-        watch_res = _ensure_gmail_watch(user, active_token)
-        db.commit()
+        db.close()
+        watch_res = _ensure_gmail_watch(watch_user, active_token)
+        storage_db = SessionLocal()
+        try:
+            stored_user = (
+                storage_db.query(UserAccount)
+                .filter(UserAccount.id == user_id)
+                .one()
+            )
+            stored_user.last_history_id = watch_res["historyId"]
+            stored_user.watch_expiration = watch_res["expiration"]
+            storage_db.commit()
+        finally:
+            storage_db.close()
         return {"status": "subscribed", "data": watch_res}
     except HTTPException:
         db.rollback()
@@ -235,18 +288,15 @@ def sync_initial_emails(
 ):
     """Imports the last three days once, then applies Gmail changes since the watch cursor."""
     token = _get_bearer_token(authorization)
+    storage_db: Session | None = None
 
     try:
         user, active_token = _resolve_user_account(token, db, create=True)
-        user = (
-            db.query(UserAccount)
-            .filter(UserAccount.id == user.id)
-            .with_for_update()
-            .one()
-        )
+        user_id = user.id
+        refresh_token = user.refresh_token
         if user.initial_sync_completed_at:
             history_id = user.last_history_id or ""
-            db.commit()
+            db.close()
             return InitialSyncResponse(
                 status="already_completed",
                 imported_count=0,
@@ -254,79 +304,95 @@ def sync_initial_emails(
                 history_id=history_id,
             )
 
-        _ensure_gmail_watch(user, active_token)
-        db.commit()
-
-        user = (
-            db.query(UserAccount)
-            .filter(UserAccount.id == user.id)
-            .with_for_update()
-            .one()
+        watch_user = UserAccount(
+            id=user_id,
+            refresh_token=refresh_token,
+            last_history_id=user.last_history_id,
+            watch_expiration=user.watch_expiration,
         )
-        if user.initial_sync_completed_at:
-            history_id = user.last_history_id or ""
-            db.commit()
-            return InitialSyncResponse(
-                status="already_completed",
-                imported_count=0,
-                skipped_count=0,
-                history_id=history_id,
-            )
-
-        start_history_id = user.last_history_id
+        db.close()
+        _ensure_gmail_watch(watch_user, active_token)
+        start_history_id = watch_user.last_history_id
         if not start_history_id:
             raise RuntimeError("Gmail watch did not save a history cursor.")
+
+        storage_db = SessionLocal()
+        stored_user = (
+            storage_db.query(UserAccount).filter(UserAccount.id == user_id).one()
+        )
+        stored_user.last_history_id = watch_user.last_history_id
+        stored_user.watch_expiration = watch_user.watch_expiration
+        storage_db.commit()
+        storage_db.close()
+        storage_db = None
 
         listed_ids, active_token = list_message_ids(
             access_token=active_token,
             query="in:inbox newer_than:3d",
-            refresh_token=user.refresh_token,
+            refresh_token=refresh_token,
         )
         changed_ids, latest_history_id, active_token = (
             fetch_new_message_ids_from_history(
                 access_token=active_token,
                 start_history_id=start_history_id,
-                refresh_token=user.refresh_token,
+                refresh_token=refresh_token,
                 raise_on_expired=True,
             )
         )
 
         message_ids = list(dict.fromkeys([*listed_ids, *changed_ids]))
+        fetched_emails = []
         imported_count = 0
         for message_id in message_ids:
-            existing = (
-                db.query(Email.id).filter(Email.id == message_id).first()
-            )
-            if existing:
-                continue
-
             email_data = fetch_single_email(
                 access_token=active_token,
                 message_id=message_id,
-                refresh_token=user.refresh_token,
+                refresh_token=refresh_token,
             )
             active_token = email_data.get("access_token", active_token)
-            if _store_email_if_new(db, user, email_data):
-                imported_count += 1
+            fetched_emails.append(email_data)
 
+        storage_db = SessionLocal()
+        user = storage_db.query(UserAccount).filter(UserAccount.id == user_id).one()
+        if user.initial_sync_completed_at:
+            history_id = user.last_history_id or ""
+            storage_db.close()
+            return InitialSyncResponse(
+                status="already_completed",
+                imported_count=0,
+                skipped_count=0,
+                history_id=history_id,
+            )
+        for email_data in fetched_emails:
+            if _store_email_if_new(storage_db, user, email_data):
+                imported_count += 1
         user.access_token = active_token
         user.last_history_id = (
             _latest_history_id(user.last_history_id, latest_history_id)
             or start_history_id
         )
         user.initial_sync_completed_at = datetime.now(timezone.utc)
-        db.commit()
+        storage_db.commit()
+        history_id = user.last_history_id
+        storage_db.close()
+        storage_db = None
         background_tasks.add_task(tag_recent_untagged_emails, user.id)
         return InitialSyncResponse(
             status="completed",
             imported_count=imported_count,
             skipped_count=len(message_ids) - imported_count,
-            history_id=user.last_history_id,
+            history_id=history_id,
         )
     except HTTPException:
+        if storage_db is not None:
+            storage_db.rollback()
+            storage_db.close()
         db.rollback()
         raise
     except Exception as e:
+        if storage_db is not None:
+            storage_db.rollback()
+            storage_db.close()
         db.rollback()
         logger.exception("Initial Gmail synchronization failed")
         raise HTTPException(
@@ -335,59 +401,72 @@ def sync_initial_emails(
 
 
 def process_realtime_email_update(email_address: str, pushed_history_id: str):
-    """Background worker: fetches delta messages from Gmail and stores them in PostgreSQL."""
+    """Fetch Gmail changes without holding database connections or locks."""
     db: Session = SessionLocal()
     try:
-        user = (
+        user_data = (
             db.query(UserAccount)
             .filter(func.lower(UserAccount.email) == email_address.lower())
-            .with_for_update()
             .first()
         )
-        if not user or not user.access_token:
+        if not user_data or not user_data.access_token:
             logger.warning("No credentials found for incoming user %s", email_address)
             return
 
-        start_id = user.last_history_id or pushed_history_id
+        user_id = user_data.id
+        access_token = user_data.access_token
+        refresh_token = user_data.refresh_token
+        start_id = user_data.last_history_id or pushed_history_id
+    finally:
+        db.close()
 
+    try:
         new_ids, latest_id, active_token = fetch_new_message_ids_from_history(
-            access_token=user.access_token,
+            access_token=access_token,
             start_history_id=start_id,
-            refresh_token=user.refresh_token,
+            refresh_token=refresh_token,
         )
-
-        user.access_token = active_token
-        user.last_history_id = _latest_history_id(user.last_history_id, latest_id)
-
+        fetched_emails = []
         for msg_id in new_ids:
-            if (
-                db.query(Email.id)
-                .filter(Email.id == msg_id, Email.user_id == user.id)
-                .first()
-            ):
-                continue
-
             email_data = fetch_single_email(
                 access_token=active_token,
                 message_id=msg_id,
-                refresh_token=user.refresh_token,
+                refresh_token=refresh_token,
             )
+            active_token = email_data.get("access_token", active_token)
+            fetched_emails.append(email_data)
+    except Exception:
+        logger.exception("Failed fetching Gmail delta for %s", email_address)
+        return
 
+    db = SessionLocal()
+    try:
+        user = db.query(UserAccount).filter(UserAccount.id == user_id).first()
+        if user is None:
+            logger.warning("Account disappeared while processing Gmail update for %s", email_address)
+            return
+        user.access_token = active_token
+        user.last_history_id = _latest_history_id(user.last_history_id, latest_id)
+        for email_data in fetched_emails:
             _store_email_if_new(db, user, email_data)
-
         db.commit()
-        tag_recent_untagged_emails(user.id)
         logger.info(
             "Ingested %d new email(s) for %s up to historyId %s",
-            len(new_ids),
+            len(fetched_emails),
             email_address,
             latest_id,
         )
     except Exception:
         db.rollback()
-        logger.exception("Failed processing Pub/Sub delta for %s", email_address)
+        logger.exception("Failed storing Gmail delta for %s", email_address)
+        return
     finally:
         db.close()
+
+    try:
+        tag_recent_untagged_emails(user_id)
+    except Exception:
+        logger.exception("Failed starting background tagging for user_id=%s", user_id)
 
 
 @router.post("/webhooks/gmail/pubsub")
@@ -515,22 +594,35 @@ def generate_draft(
     """Stream a reply draft as server-sent token events."""
     user, _ = _resolve_user_account(_get_bearer_token(authorization), db)
     db.commit()
-    email, state = _get_email_action_state(req.email_id, user.id, db)
+    email, _ = _get_email_action_state(req.email_id, user.id, db)
+    action_state = _build_action_state(email)
+    email_id = email.id
+    db.close()
 
     def events():
         generated: list[str] = []
         try:
-            for token in stream_draft_reply(_build_action_state(email)):
+            for token in stream_draft_reply(action_state):
                 generated.append(token)
                 yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
-            state.reply_outline = []
-            state.suggested_reply = "".join(generated)
-            db.commit()
+            persistence_db = SessionLocal()
+            try:
+                persisted_state = (
+                    persistence_db.query(EmailAgentStateModel)
+                    .filter(EmailAgentStateModel.email_id == email_id)
+                    .first()
+                )
+                if persisted_state is None:
+                    raise RuntimeError("Email triage state disappeared during drafting.")
+                persisted_state.reply_outline = []
+                persisted_state.suggested_reply = "".join(generated)
+                persistence_db.commit()
+            finally:
+                persistence_db.close()
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
         except Exception:
-            db.rollback()
-            logger.exception("Reply generation failed for email %s", email.id)
+            logger.exception("Reply generation failed for email %s", email_id)
             yield f"data: {json.dumps({'type': 'error', 'message': 'Reply generation failed.'})}\n\n"
 
     return StreamingResponse(
@@ -555,20 +647,25 @@ def send_reply(
     )
     if not email:
         raise HTTPException(status_code=404, detail="Email not found")
+    email_id = email.id
+    thread_id = email.thread_id or email.id
+    sender = email.sender
+    subject = email.subject
+    refresh_token = user.refresh_token
+    db.close()
     try:
         sent_id = send_email_reply(
             access_token=token,
-            email_id=email.id,
-            thread_id=email.thread_id or email.id,
-            sender=email.sender,
-            subject=email.subject,
+            email_id=email_id,
+            thread_id=thread_id,
+            sender=sender,
+            subject=subject,
             body=req.body,
-            refresh_token=user.refresh_token,
+            refresh_token=refresh_token,
         )
-        db.commit()
         return {"status": "sent", "message_id": sent_id}
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
-        logger.exception("Unable to send reply for email %s", email.id)
+        logger.exception("Unable to send reply for email %s", email_id)
         raise HTTPException(status_code=502, detail=f"Unable to send reply: {str(e)}")

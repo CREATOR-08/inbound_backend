@@ -32,6 +32,6 @@ def test_assistant(message: str) -> None:
 
 
 if __name__ == "__main__":
-    test_assistant("Show my unread emails")
-    test_assistant("What does this email mean?")
-    test_assistant("Find my interview email and draft a reply")
+
+
+    test_assistant("Find emails from indeed")

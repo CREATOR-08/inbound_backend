@@ -7,7 +7,7 @@ from app.api.routes.common import (
     _get_email_action_state,
 )
 from app.api.schemas.schemas import CalendarApprovalRequest, EmailActionRequest
-from app.db.database import get_db
+from app.db.database import SessionLocal, get_db
 from app.db.models import CalendarDraft, Email
 from app.services.calendar import create_google_calendar_event
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -26,55 +26,67 @@ def generate_schedule(
     user, _ = _resolve_user_account(_get_bearer_token(authorization), db)
     db.commit()
     email, _ = _get_email_action_state(req.email_id, user.id, db)
-    result = scheduler_node(_build_action_state(email))
+    action_state = _build_action_state(email)
+    email_id = email.id
+    email_subject = email.subject
+    db.close()
+    result = scheduler_node(action_state)
     event = result["calendar_event"]
 
-    draft = (
-        db.query(CalendarDraft)
-        .filter(CalendarDraft.email_id == email.id)
-        .first()
-    )
-    if draft and draft.status == "APPROVED":
-        raise HTTPException(
-            status_code=409,
-            detail="A calendar event has already been approved for this email",
+    db = SessionLocal()
+    try:
+        draft = (
+            db.query(CalendarDraft)
+            .join(Email, Email.id == CalendarDraft.email_id)
+            .filter(
+                CalendarDraft.email_id == email_id,
+                Email.user_id == user.id,
+            )
+            .first()
         )
+        if draft and draft.status == "APPROVED":
+            raise HTTPException(
+                status_code=409,
+                detail="A calendar event has already been approved for this email",
+            )
 
-    title = event.get("title") or email.subject or "Meeting"
-    if draft is None:
-        draft = CalendarDraft(
-            email_id=email.id,
-            title=title,
-            start_time=event["start_time"],
-            end_time=event["end_time"],
-            attendees=event.get("attendees") or [],
-            confidence=str(event.get("confidence", 0.0)),
-            status="PENDING",
-        )
-        db.add(draft)
-    else:
-        draft.title = title
-        draft.start_time = event["start_time"]
-        draft.end_time = event["end_time"]
-        draft.attendees = event.get("attendees") or []
-        draft.confidence = str(event.get("confidence", 0.0))
-        draft.status = "PENDING"
+        title = event.get("title") or email_subject or "Meeting"
+        if draft is None:
+            draft = CalendarDraft(
+                email_id=email_id,
+                title=title,
+                start_time=event["start_time"],
+                end_time=event["end_time"],
+                attendees=event.get("attendees") or [],
+                confidence=str(event.get("confidence", 0.0)),
+                status="PENDING",
+            )
+            db.add(draft)
+        else:
+            draft.title = title
+            draft.start_time = event["start_time"]
+            draft.end_time = event["end_time"]
+            draft.attendees = event.get("attendees") or []
+            draft.confidence = str(event.get("confidence", 0.0))
+            draft.status = "PENDING"
 
-    db.commit()
-    db.refresh(draft)
-
-    return {
-        "confirmation_required": True,
-        "calendar_event": {
-            "draft_id": str(draft.id),
-            "title": draft.title,
-            "start_time": draft.start_time,
-            "end_time": draft.end_time,
-            "attendees": draft.attendees or [],
-            "confidence": float(draft.confidence or 0),
-            "status": draft.status,
-        },
-    }
+        db.commit()
+        db.refresh(draft)
+        response = {
+            "confirmation_required": True,
+            "calendar_event": {
+                "draft_id": str(draft.id),
+                "title": draft.title,
+                "start_time": draft.start_time,
+                "end_time": draft.end_time,
+                "attendees": draft.attendees or [],
+                "confidence": float(draft.confidence or 0),
+                "status": draft.status,
+            },
+        }
+        return response
+    finally:
+        db.close()
 
 
 @action_router.post("/calendar/confirm")
@@ -131,23 +143,39 @@ def confirm_calendar_event(
         )
 
     try:
-        draft.title = title
-        draft.start_time = start_time
-        draft.end_time = end_time
-        draft.attendees = req.attendees if req.attendees is not None else draft.attendees
+        draft_id = draft.id
+        attendees = req.attendees if req.attendees is not None else draft.attendees
+        db.close()
         created = create_google_calendar_event(
             access_token=token,
-            title=draft.title,
-            start_time=draft.start_time,
-            end_time=draft.end_time,
-            attendees=draft.attendees,
+            title=title,
+            start_time=start_time,
+            end_time=end_time,
+            attendees=attendees,
         )
 
-        draft.status = "APPROVED"
-        draft.google_event_id = created.get("id")
-        db.commit()
+        db = SessionLocal()
+        try:
+            persisted_draft = (
+                db.query(CalendarDraft)
+                .join(Email, Email.id == CalendarDraft.email_id)
+                .filter(CalendarDraft.id == draft_id, Email.user_id == user.id)
+                .first()
+            )
+            if persisted_draft is None:
+                raise RuntimeError("Calendar draft disappeared after event creation.")
+            persisted_draft.title = title
+            persisted_draft.start_time = start_time
+            persisted_draft.end_time = end_time
+            persisted_draft.attendees = attendees
+            persisted_draft.status = "APPROVED"
+            persisted_draft.google_event_id = created.get("id")
+            db.commit()
+            google_event_id = persisted_draft.google_event_id
+        finally:
+            db.close()
 
-        return {"status": "success", "google_event_id": draft.google_event_id}
+        return {"status": "success", "google_event_id": google_event_id}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Google Calendar Error: {str(e)}")

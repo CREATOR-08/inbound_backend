@@ -10,6 +10,7 @@ from app.agent.Assistant.nodes import (
     fetch_context,
     load_session_context,
     plan_actions,
+    plan_data_query,
     plan_workflow,
     receive_input,
     validate_response,
@@ -18,7 +19,11 @@ from app.agent.Assistant.state import AssistantState
 
 
 def route_after_input(state: AssistantState) -> str:
-    return "validate_response" if state.get("error") else "load_session_context"
+    if state.get("error"):
+        return "validate_response"
+    if state.get("approved_workflow") and state.get("confirm_workflow"):
+        return "execute_tools"
+    return "load_session_context"
 
 
 def route_after_classification(state: AssistantState) -> str:
@@ -26,6 +31,7 @@ def route_after_classification(state: AssistantState) -> str:
         return "validate_response"
     return {
         "UI_ACTION": "plan_actions",
+        "DATA_QUERY": "plan_data_query",
         "QUESTION": "fetch_context",
         "WORKFLOW": "plan_workflow",
         "CLARIFICATION": "clarify_request",
@@ -38,6 +44,7 @@ def build_assistant_graph():
     graph.add_node("receive_input", receive_input)
     graph.add_node("load_session_context", load_session_context)
     graph.add_node("classify_intent", classify_intent)
+    graph.add_node("plan_data_query", plan_data_query)
     graph.add_node("plan_actions", plan_actions)
     graph.add_node("fetch_context", fetch_context)
     graph.add_node("answer_question", answer_question)
@@ -50,7 +57,11 @@ def build_assistant_graph():
     graph.add_conditional_edges(
         "receive_input",
         route_after_input,
-        {"load_session_context": "load_session_context", "validate_response": "validate_response"},
+        {
+            "load_session_context": "load_session_context",
+            "execute_tools": "execute_tools",
+            "validate_response": "validate_response",
+        },
     )
     graph.add_edge("load_session_context", "classify_intent")
     graph.add_conditional_edges(
@@ -58,6 +69,7 @@ def build_assistant_graph():
         route_after_classification,
         {
             "plan_actions": "plan_actions",
+            "plan_data_query": "plan_data_query",
             "fetch_context": "fetch_context",
             "plan_workflow": "plan_workflow",
             "clarify_request": "clarify_request",
@@ -66,9 +78,14 @@ def build_assistant_graph():
     )
 
     graph.add_edge("plan_actions", "validate_response")
+    graph.add_edge("plan_data_query", "validate_response")
     graph.add_edge("fetch_context", "answer_question")
     graph.add_edge("answer_question", "validate_response")
-    graph.add_edge("plan_workflow", "execute_tools")
+    graph.add_conditional_edges(
+        "plan_workflow",
+        lambda state: "execute_tools" if state.get("execute_workflow") else "validate_response",
+        {"execute_tools": "execute_tools", "validate_response": "validate_response"},
+    )
     graph.add_edge("execute_tools", "validate_response")
     graph.add_edge("clarify_request", "validate_response")
     graph.add_edge("validate_response", END)

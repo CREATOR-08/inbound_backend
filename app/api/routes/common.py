@@ -3,6 +3,13 @@ from app.db.models import Email, EmailAgentStateModel
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+__all__ = [
+    "VALID_CATEGORIES",
+    "VALID_PRIORITIES",
+    "_get_email_action_state",
+    "_build_action_state",
+]
+
 VALID_CATEGORIES = ("MEETING_REQUEST", "ACTION_REQUIRED", "INFORMATIONAL", "SPAM")
 
 
