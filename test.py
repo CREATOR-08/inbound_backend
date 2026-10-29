@@ -1,49 +1,37 @@
+
+from pprint import pprint
+
 from app.agent.Assistant.graph import assistant_graph
 
 
-def test_ui_action():
+def test_assistant(message: str) -> None:
+    print("\n" + "=" * 60)
+    print(f"USER: {message}")
+    print("=" * 60)
+
     result = assistant_graph.invoke({
         "user_id": "test-user",
-        "session_id": "test-session",
-        "message": "Show my urgent emails",
+        "session_id": "test-session-001",
+        "message": message,
         "page_context": {
             "page": "inbox",
             "active_filter": "ALL",
+            "selected_email_id": None,
         },
+        "conversation_history": [],
     })
 
-    print("\nUI ACTION RESULT")
-    print(result["response"])
+    print("\nASSISTANT RESPONSE:")
+    pprint(result.get("response"))
 
+    print("\nCLASSIFIED INTENT:")
+    print(result.get("intent"))
 
-def test_question():
-    result = assistant_graph.invoke({
-        "user_id": "test-user",
-        "session_id": "test-session",
-        "message": "Summarize this email",
-        "page_context": {
-            "page": "email_detail",
-            "selected_email_id": "email-123",
-        },
-    })
-
-    print("\nQUESTION RESULT")
-    print(result["response"])
-
-
-def test_clarification():
-    result = assistant_graph.invoke({
-        "user_id": "test-user",
-        "session_id": "test-session",
-        "message": "Do something useful",
-        "page_context": {},
-    })
-
-    print("\nCLARIFICATION RESULT")
-    print(result["response"])
+    print("\nACTION PLAN:")
+    pprint(result.get("action_plan"))
 
 
 if __name__ == "__main__":
-    test_ui_action()
-    test_question()
-    test_clarification()
+    test_assistant("Show my unread emails")
+    test_assistant("What does this email mean?")
+    test_assistant("Find my interview email and draft a reply")

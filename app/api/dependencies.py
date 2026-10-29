@@ -7,6 +7,8 @@ from fastapi import HTTPException
 from googleapiclient.errors import HttpError
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from fastapi import Depends, Header
+from app.db.database import get_db
 
 logger = logging.getLogger(__name__)
 
@@ -71,3 +73,20 @@ def _resolve_user_account(
         user.access_token = active_token
 
     return user, active_token
+
+
+
+def get_current_user(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+) -> UserAccount:
+    access_token = _get_bearer_token(authorization)
+
+    user, _ = _resolve_user_account(
+        access_token=access_token,
+        db=db,
+        create=False,
+        timing_context="assistant",
+    )
+
+    return user

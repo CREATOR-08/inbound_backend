@@ -1,9 +1,12 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 
-api_key = "AQ.Ab8RN6K9Z5s-P_pD48l1SYEi3YN5hbJb8_dAt690AmpSmhDTWA"
+
+api_key=os.getenv("GOOGLE_API_KEY")
 
 if not api_key:
     raise RuntimeError(
@@ -16,4 +19,6 @@ llm = ChatGoogleGenerativeAI(
     model="gemini-3.8-flash",
     google_api_key=api_key,
     temperature=0,
+    max_retries=2,
+    
 )
