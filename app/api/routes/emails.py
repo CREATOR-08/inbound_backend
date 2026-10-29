@@ -4,142 +4,39 @@ import logging
 from datetime import datetime, timezone
 from time import perf_counter
 
-from app.agent.nodes import scheduler_node, stream_draft_reply
 from app.agent.graph import triage_graph
-from app.agent.state import EmailAgentState
+from app.agent.nodes import stream_draft_reply
+from app.api.dependencies import _get_bearer_token, _resolve_user_account
+from app.api.routes.common import (
+    VALID_CATEGORIES,
+    VALID_PRIORITIES,
+    _build_action_state,
+    _get_email_action_state,
+)
 from app.api.schemas.schemas import (
-    CalendarApprovalRequest,
     EmailActionRequest,
     EmailSendRequest,
     InitialSyncResponse,
     PubSubPushRequest,
 )
 from app.db.database import SessionLocal, get_db
-from app.db.models import (
-    CalendarDraft,
-    Email,
-    EmailAgentStateModel,
-    UserAccount,
-)
-from app.services.calendar import create_google_calendar_event
+from app.db.models import Email, EmailAgentStateModel, UserAccount
 from app.services.gmail import (
     fetch_new_message_ids_from_history,
     fetch_single_email,
-    get_gmail_service_from_token,
     list_message_ids,
     send_email_reply,
     start_gmail_watch,
 )
-from fastapi import (
-    APIRouter,
-    BackgroundTasks,
-    Depends,
-    Header,
-    HTTPException,
-    Response,
-)
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Response
 from fastapi.responses import StreamingResponse
-from googleapiclient.errors import HttpError
-from sqlalchemy import and_, func, or_
-from sqlalchemy.orm import Session, contains_eager, joinedload, load_only
+from sqlalchemy import func, or_
+from sqlalchemy.orm import Session, joinedload, load_only
 
 logger = logging.getLogger(__name__)
 
-VALID_CATEGORIES = ("MEETING_REQUEST", "ACTION_REQUIRED", "INFORMATIONAL", "SPAM")
-VALID_PRIORITIES = ("HIGH", "MEDIUM", "LOW")
-
 router = APIRouter()
 action_router = APIRouter()
-
-api_v1_router = APIRouter(prefix="/api/v1")
-api_v1_router.include_router(router)
-api_v1_router.include_router(action_router, prefix="/actions")
-
-
-
-
-def _get_bearer_token(authorization: str) -> str:
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token.strip():
-        raise HTTPException(status_code=401, detail="Invalid token header format")
-    return token.strip()
-
-
-def _get_email_action_state(
-    email_id: str, user_id: str, db: Session
-) -> tuple[Email, EmailAgentStateModel]:
-    email = (
-        db.query(Email)
-        .filter(Email.id == email_id, Email.user_id == user_id)
-        .first()
-    )
-    if not email:
-        raise HTTPException(status_code=404, detail="Email not found")
-
-    state = (
-        db.query(EmailAgentStateModel)
-        .filter(EmailAgentStateModel.email_id == email_id)
-        .first()
-    )
-    if not state:
-        raise HTTPException(status_code=409, detail="Email has not been triaged")
-
-    return email, state
-
-
-def _resolve_user_account(
-    access_token: str,
-    db: Session,
-    create: bool = False,
-    timing_context: str | None = None,
-) -> tuple[UserAccount, str]:
-    try:
-        google_profile_started = perf_counter()
-        service, active_token = get_gmail_service_from_token(access_token)
-        profile = service.users().getProfile(userId="me").execute()
-        google_profile_ms = (perf_counter() - google_profile_started) * 1000
-    except HttpError as error:
-        status = getattr(getattr(error, "resp", None), "status", None)
-        logger.info("Google rejected Gmail authentication with status %s", status)
-        raise HTTPException(
-            status_code=status if status in (401, 403) else 502,
-            detail="Unable to authenticate this Gmail account.",
-        ) from error
-
-    user_email = profile.get("emailAddress")
-    if not user_email:
-        raise HTTPException(
-            status_code=401, detail="Google did not return a Gmail account."
-        )
-
-    account_lookup_started = perf_counter()
-    user = (
-        db.query(UserAccount)
-        .filter(func.lower(UserAccount.email) == user_email.lower())
-        .first()
-    )
-    account_lookup_ms = (perf_counter() - account_lookup_started) * 1000
-    if timing_context:
-        logger.info(
-            "%s_auth_timing google_profile_ms=%.1f account_lookup_ms=%.1f",
-            timing_context,
-            google_profile_ms,
-            account_lookup_ms,
-        )
-    if user is None:
-        if not create:
-            raise HTTPException(status_code=404, detail="Gmail account not found.")
-        user = UserAccount(
-            id=user_email.lower(),
-            email=user_email,
-            access_token=active_token,
-        )
-        db.add(user)
-        db.flush()
-    else:
-        user.access_token = active_token
-
-    return user, active_token
 
 
 def _watch_is_active(expiration: str | None) -> bool:
@@ -210,21 +107,6 @@ def _store_email_if_new(
         )
     )
     return True
-
-
-def _build_action_state(email: Email) -> EmailAgentState:
-    return {
-        "email_id": email.id,
-        "sender": email.sender or "",
-        "subject": email.subject or "",
-        "body": email.body or email.preview or "",
-        "category": None,
-        "priority": None,
-        "reply_outline": None,
-        "suggested_reply": None,
-        "calendar_event": None,
-        "is_archived": False,
-    }
 
 
 def tag_recent_untagged_emails(user_id: str, limit: int = 10) -> None:
@@ -313,11 +195,6 @@ def tag_recent_untagged_emails(user_id: str, limit: int = 10) -> None:
             updated,
         )
         db.close()
-
-
-# =========================================================================
-# 1. Pub/Sub Watch Registration & Webhook
-# =========================================================================
 
 
 @router.post("/emails/watch")
@@ -535,11 +412,6 @@ async def gmail_pubsub_webhook(
     return Response(status_code=204)
 
 
-# =========================================================================
-# 2. Email Query & Body Endpoints
-# =========================================================================
-
-
 @router.get("/emails")
 def get_emails(
     authorization: str = Header(...),
@@ -634,11 +506,6 @@ def get_email_body(
     }
 
 
-# =========================================================================
-# 3. Actions: Drafting, Sending, Scheduling
-# =========================================================================
-
-
 @action_router.post("/draft")
 def generate_draft(
     req: EmailActionRequest,
@@ -705,140 +572,3 @@ def send_reply(
     except Exception as e:
         logger.exception("Unable to send reply for email %s", email.id)
         raise HTTPException(status_code=502, detail=f"Unable to send reply: {str(e)}")
-
-
-@action_router.post("/schedule")
-def generate_schedule(
-    req: EmailActionRequest,
-    authorization: str = Header(...),
-    db: Session = Depends(get_db),
-):
-    """Extract a calendar proposal for user review without creating an event."""
-    user, _ = _resolve_user_account(_get_bearer_token(authorization), db)
-    db.commit()
-    email, _ = _get_email_action_state(req.email_id, user.id, db)
-    result = scheduler_node(_build_action_state(email))
-    event = result["calendar_event"]
-
-    draft = (
-        db.query(CalendarDraft)
-        .filter(CalendarDraft.email_id == email.id)
-        .first()
-    )
-    if draft and draft.status == "APPROVED":
-        raise HTTPException(
-            status_code=409,
-            detail="A calendar event has already been approved for this email",
-        )
-
-    title = event.get("title") or email.subject or "Meeting"
-    if draft is None:
-        draft = CalendarDraft(
-            email_id=email.id,
-            title=title,
-            start_time=event["start_time"],
-            end_time=event["end_time"],
-            attendees=event.get("attendees") or [],
-            confidence=str(event.get("confidence", 0.0)),
-            status="PENDING",
-        )
-        db.add(draft)
-    else:
-        draft.title = title
-        draft.start_time = event["start_time"]
-        draft.end_time = event["end_time"]
-        draft.attendees = event.get("attendees") or []
-        draft.confidence = str(event.get("confidence", 0.0))
-        draft.status = "PENDING"
-
-    db.commit()
-    db.refresh(draft)
-
-    return {
-        "confirmation_required": True,
-        "calendar_event": {
-            "draft_id": str(draft.id),
-            "title": draft.title,
-            "start_time": draft.start_time,
-            "end_time": draft.end_time,
-            "attendees": draft.attendees or [],
-            "confidence": float(draft.confidence or 0),
-            "status": draft.status,
-        },
-    }
-
-
-@action_router.post("/calendar/confirm")
-def confirm_calendar_event(
-    req: CalendarApprovalRequest,
-    authorization: str = Header(...),
-    db: Session = Depends(get_db),
-):
-    """HITL Gate: Pushes the drafted event to Google Calendar once user approves."""
-    user, token = _resolve_user_account(_get_bearer_token(authorization), db)
-    db.commit()
-
-    draft = (
-        db.query(CalendarDraft)
-        .join(Email, Email.id == CalendarDraft.email_id)
-        .filter(
-            CalendarDraft.id == req.draft_id,
-            Email.user_id == user.id,
-        )
-        .first()
-    )
-    if not draft:
-        raise HTTPException(status_code=404, detail="Draft not found")
-
-    if draft.status == "APPROVED":
-        return {"status": "already_approved", "google_event_id": draft.google_event_id}
-
-    title = req.title or draft.title
-    start_time = req.start_time or draft.start_time
-    end_time = req.end_time or draft.end_time
-
-    if not title.strip() or "T" not in start_time or "T" not in end_time:
-        raise HTTPException(
-            status_code=422,
-            detail="A title and ISO 8601 start_time/end_time are required",
-        )
-    try:
-        start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-        end = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
-    except ValueError:
-        raise HTTPException(
-            status_code=422,
-            detail="A valid ISO 8601 start_time and end_time are required",
-        )
-    if (start.utcoffset() is None) != (end.utcoffset() is None):
-        raise HTTPException(
-            status_code=422,
-            detail="The calendar event start_time and end_time must use compatible timezones",
-        )
-    if end <= start:
-        raise HTTPException(
-            status_code=422,
-            detail="The calendar event end_time must be after start_time",
-        )
-
-    try:
-        draft.title = title
-        draft.start_time = start_time
-        draft.end_time = end_time
-        draft.attendees = req.attendees if req.attendees is not None else draft.attendees
-        created = create_google_calendar_event(
-            access_token=token,
-            title=draft.title,
-            start_time=draft.start_time,
-            end_time=draft.end_time,
-            attendees=draft.attendees,
-        )
-
-        draft.status = "APPROVED"
-        draft.google_event_id = created.get("id")
-        db.commit()
-
-        return {"status": "success", "google_event_id": draft.google_event_id}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Google Calendar Error: {str(e)}")

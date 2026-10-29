@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.routes import api_v1_router
+from app.api.router import api_router
 
 app = FastAPI(title="MailFlow Backend")
 
@@ -14,7 +14,7 @@ app.add_middleware(
 )
 
 # Register routes
-app.include_router(api_v1_router)
+app.include_router(api_router)
 
 @app.get("/health")
 def health_check():

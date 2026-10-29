@@ -1,0 +1,153 @@
+from datetime import datetime
+
+from app.agent.nodes import scheduler_node
+from app.api.dependencies import _get_bearer_token, _resolve_user_account
+from app.api.routes.common import (
+    _build_action_state,
+    _get_email_action_state,
+)
+from app.api.schemas.schemas import CalendarApprovalRequest, EmailActionRequest
+from app.db.database import get_db
+from app.db.models import CalendarDraft, Email
+from app.services.calendar import create_google_calendar_event
+from fastapi import APIRouter, Depends, Header, HTTPException
+from sqlalchemy.orm import Session
+
+action_router = APIRouter()
+
+
+@action_router.post("/schedule")
+def generate_schedule(
+    req: EmailActionRequest,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Extract a calendar proposal for user review without creating an event."""
+    user, _ = _resolve_user_account(_get_bearer_token(authorization), db)
+    db.commit()
+    email, _ = _get_email_action_state(req.email_id, user.id, db)
+    result = scheduler_node(_build_action_state(email))
+    event = result["calendar_event"]
+
+    draft = (
+        db.query(CalendarDraft)
+        .filter(CalendarDraft.email_id == email.id)
+        .first()
+    )
+    if draft and draft.status == "APPROVED":
+        raise HTTPException(
+            status_code=409,
+            detail="A calendar event has already been approved for this email",
+        )
+
+    title = event.get("title") or email.subject or "Meeting"
+    if draft is None:
+        draft = CalendarDraft(
+            email_id=email.id,
+            title=title,
+            start_time=event["start_time"],
+            end_time=event["end_time"],
+            attendees=event.get("attendees") or [],
+            confidence=str(event.get("confidence", 0.0)),
+            status="PENDING",
+        )
+        db.add(draft)
+    else:
+        draft.title = title
+        draft.start_time = event["start_time"]
+        draft.end_time = event["end_time"]
+        draft.attendees = event.get("attendees") or []
+        draft.confidence = str(event.get("confidence", 0.0))
+        draft.status = "PENDING"
+
+    db.commit()
+    db.refresh(draft)
+
+    return {
+        "confirmation_required": True,
+        "calendar_event": {
+            "draft_id": str(draft.id),
+            "title": draft.title,
+            "start_time": draft.start_time,
+            "end_time": draft.end_time,
+            "attendees": draft.attendees or [],
+            "confidence": float(draft.confidence or 0),
+            "status": draft.status,
+        },
+    }
+
+
+@action_router.post("/calendar/confirm")
+def confirm_calendar_event(
+    req: CalendarApprovalRequest,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """HITL Gate: Pushes the drafted event to Google Calendar once user approves."""
+    user, token = _resolve_user_account(_get_bearer_token(authorization), db)
+    db.commit()
+
+    draft = (
+        db.query(CalendarDraft)
+        .join(Email, Email.id == CalendarDraft.email_id)
+        .filter(
+            CalendarDraft.id == req.draft_id,
+            Email.user_id == user.id,
+        )
+        .first()
+    )
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+
+    if draft.status == "APPROVED":
+        return {"status": "already_approved", "google_event_id": draft.google_event_id}
+
+    title = req.title or draft.title
+    start_time = req.start_time or draft.start_time
+    end_time = req.end_time or draft.end_time
+
+    if not title.strip() or "T" not in start_time or "T" not in end_time:
+        raise HTTPException(
+            status_code=422,
+            detail="A title and ISO 8601 start_time/end_time are required",
+        )
+    try:
+        start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="A valid ISO 8601 start_time and end_time are required",
+        )
+    if (start.utcoffset() is None) != (end.utcoffset() is None):
+        raise HTTPException(
+            status_code=422,
+            detail="The calendar event start_time and end_time must use compatible timezones",
+        )
+    if end <= start:
+        raise HTTPException(
+            status_code=422,
+            detail="The calendar event end_time must be after start_time",
+        )
+
+    try:
+        draft.title = title
+        draft.start_time = start_time
+        draft.end_time = end_time
+        draft.attendees = req.attendees if req.attendees is not None else draft.attendees
+        created = create_google_calendar_event(
+            access_token=token,
+            title=draft.title,
+            start_time=draft.start_time,
+            end_time=draft.end_time,
+            attendees=draft.attendees,
+        )
+
+        draft.status = "APPROVED"
+        draft.google_event_id = created.get("id")
+        db.commit()
+
+        return {"status": "success", "google_event_id": draft.google_event_id}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Google Calendar Error: {str(e)}")
