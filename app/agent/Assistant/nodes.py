@@ -15,6 +15,7 @@ from app.api.schemas.assistant import (
     PlannedUIAction,
     WorkflowStep,
 )
+from app.db.models import Email
 from app.services.assistant_queries import get_email_for_user, search_emails
 from app.services.gmail import send_email_reply
 
@@ -23,6 +24,127 @@ MAX_MESSAGE_LENGTH = 8_000
 MAX_HISTORY_MESSAGES = 20
 MAX_HISTORY_CHARS = 8_000
 MAX_CONTEXT_CHARS = 20_000
+
+_EMAIL_QUERY_FIELDS = {
+    "sender": {
+        "column": "sender",
+        "meaning": "Email sender.",
+        "operators": ["eq", "contains", "in"],
+    },
+    "subject": {
+        "column": "subject",
+        "meaning": "Email subject.",
+        "operators": ["eq", "contains", "in"],
+    },
+    "priority": {
+        "column": "priority",
+        "meaning": "Stored email priority; distinct from category and urgency.",
+        "effective_value": "email_agent_states.priority when present, otherwise emails.priority",
+        "operators": ["eq", "in"],
+        "allowed_values": ["HIGH", "MEDIUM", "LOW"],
+    },
+    "category": {
+        "column": "category",
+        "meaning": "Email classification category, including ACTION_REQUIRED.",
+        "effective_value": "email_agent_states.category when present, otherwise emails.category",
+        "operators": ["eq", "in"],
+        "allowed_values": [
+            "MEETING_REQUEST",
+            "ACTION_REQUIRED",
+            "INFORMATIONAL",
+            "SPAM",
+        ],
+    },
+    "received_at": {
+        "column": "created_at",
+        "meaning": "Stored email received/creation timestamp.",
+        "operators": ["eq", "gt", "gte", "lt", "lte", "between"],
+    },
+    "is_archived": {
+        "column": "is_archived",
+        "meaning": "Whether the email is archived.",
+        "effective_value": "email_agent_states.is_archived when present, otherwise emails.is_archived",
+        "operators": ["eq", "in"],
+        "allowed_values": [True, False],
+    },
+}
+_EMAIL_COLUMN_MEANINGS = {
+    "id": "Email identifier.",
+    "thread_id": "Gmail thread identifier.",
+    "user_id": "Owning user; the backend scopes this from authenticated identity.",
+    "sender": "Email sender.",
+    "subject": "Email subject.",
+    "preview": "Stored email preview text.",
+    "body": "Stored plain-text email body.",
+    "body_html": "Stored HTML email body.",
+    "has_html": "Whether an HTML body is available.",
+    "category": "Email classification category.",
+    "priority": "Stored email priority.",
+    "is_archived": "Whether the email is archived.",
+    "created_at": "Stored email received/creation timestamp.",
+}
+_EMAIL_SORT_FIELDS = ["received_at", "sender", "subject", "priority"]
+
+
+def describe_email_query_schema() -> dict[str, Any]:
+    """Describe actual Email columns and the existing assistant query allowlist."""
+    query_field_by_column = {
+        details["column"]: name for name, details in _EMAIL_QUERY_FIELDS.items()
+    }
+    columns = []
+    for column in Email.__table__.columns:
+        query_field = query_field_by_column.get(column.name)
+        query_details = _EMAIL_QUERY_FIELDS.get(query_field, {})
+        column_description = {
+            "name": column.name,
+            "type": repr(column.type),
+            "nullable": column.nullable,
+            "primary_key": column.primary_key,
+            "meaning": _EMAIL_COLUMN_MEANINGS.get(
+                column.name, "Email field stored by the application."
+            ),
+            "queryable": query_field is not None,
+            "operators": query_details.get("operators", []),
+        }
+        if query_field is not None and query_field != column.name:
+            column_description["query_field"] = query_field
+        if "effective_value" in query_details:
+            column_description["effective_value"] = query_details["effective_value"]
+        if query_details.get("allowed_values") is not None:
+            column_description["allowed_values"] = query_details["allowed_values"]
+        columns.append(column_description)
+
+    query_fields = {
+        name: {
+            "model_column": details["column"],
+            "meaning": details["meaning"],
+            "operators": details["operators"],
+            **(
+                {"effective_value": details["effective_value"]}
+                if "effective_value" in details
+                else {}
+            ),
+            **(
+                {"allowed_values": details["allowed_values"]}
+                if "allowed_values" in details
+                else {}
+            ),
+        }
+        for name, details in _EMAIL_QUERY_FIELDS.items()
+    }
+    return {
+        "model": Email.__name__,
+        "table": Email.__tablename__,
+        "columns": columns,
+        "query_spec": {
+            "resource": "emails",
+            "query_fields": query_fields,
+            "sort_by": _EMAIL_SORT_FIELDS,
+            "sort_order": ["asc", "desc"],
+            "limit": {"minimum": 1, "maximum": 50},
+            "offset": {"minimum": 0, "maximum": 10000},
+        },
+    }
 
 
 class IntentResult(BaseModel):
@@ -263,16 +385,25 @@ def plan_data_query(state: AssistantState) -> dict[str, Any]:
             ),
         }
 
-    prompt = f"""Convert the request into the supplied structured email query specification.
-    Only search the local email store. Do not fetch or synchronize Gmail messages.
-    Supported fields: sender, subject, priority, category, received_at, is_archived.
-    Supported operators: eq, contains (sender/subject only), gt, gte, lt, lte, in, between.
-    There is no read/unread field in the database; report unread requests in unsupported_features.
-    Use limit at most 50, offset 0 unless pagination was requested.
-    Use source gmail only when the user explicitly asks to fetch/synchronize new Gmail data.
-    Do not generate SQL.
-    Current UTC date: {datetime.now(timezone.utc).date().isoformat()}
-    Request: {state["message"]}"""  # noqa: UP017
+    prompt = f"""Understand the request and convert it into the supplied structured email query specification.
+Use only query fields, operators, sorting, pagination, and categorical values listed in the schema below.
+The category field is the email's classification category; priority is the email's stored priority.
+For category requests use category, and for priority requests use priority. ACTION_REQUIRED is a supported category value, never a priority value. Priority values are only HIGH, MEDIUM, or LOW.
+Urgency and requires_action are not Email columns or supported query fields. Do not treat priority as urgency or invent a separate action-required field. For emails classified as action-required, use category=ACTION_REQUIRED only when that classification matches the request; otherwise report the unsupported feature and request clarification.
+Do not include user_id or any authorization constraint in the query; the backend scopes results to the authenticated user.
+Only search the local email store. Do not fetch or synchronize Gmail messages unless the user explicitly asks to fetch/synchronize new Gmail data, in which case set source to gmail.
+Do not generate SQL or name any tables or fields outside the supplied schema.
+There is no read/unread field; report unread requests in unsupported_features.
+If the request cannot be represented accurately, set requires_clarification and explain why in message rather than inventing a field, value, or substitute.
+Use limit at most 50 and offset 0 unless pagination was requested.
+Do not claim that matching emails exist or that the query succeeded; the backend will execute the query and return actual results. Keep message neutral and do not invent results.
+Return output conforming exactly to the structured schema.
+
+Actual SQLAlchemy Email schema and query allowlist:
+{json.dumps(describe_email_query_schema(), ensure_ascii=False)}
+
+Current UTC date: {datetime.now(timezone.utc).date().isoformat()}
+Request: {state["message"]}"""  # noqa: UP017
     try:
         plan = _invoke_structured("fast", DataQueryPlan, prompt)
     except Exception as error:

@@ -1,5 +1,3 @@
-from datetime import datetime
-
 from app.agent.nodes import scheduler_node
 from app.api.dependencies import _get_bearer_token, _resolve_user_account
 from app.api.routes.common import (
@@ -9,11 +7,31 @@ from app.api.routes.common import (
 from app.api.schemas.schemas import CalendarApprovalRequest, EmailActionRequest
 from app.db.database import SessionLocal, get_db
 from app.db.models import CalendarDraft, Email
-from app.services.calendar import create_google_calendar_event
+from app.services.calendar import (
+    create_google_calendar_event,
+    normalize_calendar_event_times,
+)
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 action_router = APIRouter()
+
+SCHEDULE_AMBIGUITY_MESSAGE = (
+    "The email does not provide complete, unambiguous event times. "
+    "Enter the start and end times manually to continue."
+)
+
+
+def _schedule_proposal_times(event: dict) -> tuple[str, str, float, str | None]:
+    confidence = float(event.get("confidence", 0.0))
+    if confidence <= 0:
+        return "", "", confidence, SCHEDULE_AMBIGUITY_MESSAGE
+
+    start_time, end_time = normalize_calendar_event_times(
+        event["start_time"],
+        event["end_time"],
+    )
+    return start_time, end_time, confidence, None
 
 
 @action_router.post("/schedule")
@@ -29,9 +47,17 @@ def generate_schedule(
     action_state = _build_action_state(email)
     email_id = email.id
     email_subject = email.subject
+    email_received_at = email.created_at.isoformat() if email.created_at else None
     db.close()
-    result = scheduler_node(action_state)
+    result = scheduler_node(action_state, email_received_at)
     event = result["calendar_event"]
+    try:
+        start_time, end_time, confidence, ambiguity = _schedule_proposal_times(event)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Schedule extraction returned invalid event times.",
+        ) from exc
 
     db = SessionLocal()
     try:
@@ -55,19 +81,19 @@ def generate_schedule(
             draft = CalendarDraft(
                 email_id=email_id,
                 title=title,
-                start_time=event["start_time"],
-                end_time=event["end_time"],
+                start_time=start_time,
+                end_time=end_time,
                 attendees=event.get("attendees") or [],
-                confidence=str(event.get("confidence", 0.0)),
+                confidence=str(confidence),
                 status="PENDING",
             )
             db.add(draft)
         else:
             draft.title = title
-            draft.start_time = event["start_time"]
-            draft.end_time = event["end_time"]
+            draft.start_time = start_time
+            draft.end_time = end_time
             draft.attendees = event.get("attendees") or []
-            draft.confidence = str(event.get("confidence", 0.0))
+            draft.confidence = str(confidence)
             draft.status = "PENDING"
 
         db.commit()
@@ -81,6 +107,7 @@ def generate_schedule(
                 "end_time": draft.end_time,
                 "attendees": draft.attendees or [],
                 "confidence": float(draft.confidence or 0),
+                "ambiguity": ambiguity,
                 "status": draft.status,
             },
         }
@@ -118,29 +145,18 @@ def confirm_calendar_event(
     start_time = req.start_time or draft.start_time
     end_time = req.end_time or draft.end_time
 
-    if not title.strip() or "T" not in start_time or "T" not in end_time:
+    if not title.strip():
         raise HTTPException(
             status_code=422,
             detail="A title and ISO 8601 start_time/end_time are required",
         )
     try:
-        start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-        end = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
-    except ValueError:
+        start_time, end_time = normalize_calendar_event_times(start_time, end_time)
+    except ValueError as exc:
         raise HTTPException(
             status_code=422,
-            detail="A valid ISO 8601 start_time and end_time are required",
-        )
-    if (start.utcoffset() is None) != (end.utcoffset() is None):
-        raise HTTPException(
-            status_code=422,
-            detail="The calendar event start_time and end_time must use compatible timezones",
-        )
-    if end <= start:
-        raise HTTPException(
-            status_code=422,
-            detail="The calendar event end_time must be after start_time",
-        )
+            detail=str(exc),
+        ) from exc
 
     try:
         draft_id = draft.id

@@ -1,5 +1,5 @@
 import os
-from typing import Iterator
+from typing import Iterator, Optional
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -10,6 +10,7 @@ from app.agent.state import (
     ReplyDraftOutput,
 )
 from app.services.gmail import clean_text_for_llm
+from app.agent.prompt import SYSTEM_PROMPT
 load_dotenv()
 api_key = os.getenv("GOOGLE_API_KEY")
 if not api_key:
@@ -31,12 +32,27 @@ llm2=ChatGoogleGenerativeAI(
 
 # Node 1: Triage & Classify
 def triage_node(state: EmailAgentState) -> dict:
+    from langchain_core.prompts import ChatPromptTemplate
+
     prompt = ChatPromptTemplate.from_messages([
         (
             "system",
-            "You are an executive email triage assistant. Classify the email category and urgency accurately.",
+            SYSTEM_PROMPT,  # Store the complete prompt above here
         ),
-        ("human", "Subject: {subject}\nSender: {sender}\nBody:\n{body}"),
+        (
+            "human",
+            """Classify the following email.
+
+    <email>
+    Subject: {subject}
+    Sender: {sender}
+
+    Body:
+    {body}
+    </email>
+
+    Return the classification in the required JSON format."""
+        ),
     ])
 
     structured_llm = llm.with_structured_output(TriageOutput)
@@ -109,15 +125,26 @@ def stream_draft_reply(state: EmailAgentState) -> Iterator[str]:
 
 
 # Node 3: Calendar Extractor
-def scheduler_node(state: EmailAgentState) -> dict:
+def scheduler_node(
+    state: EmailAgentState, email_received_at: Optional[str] = None
+) -> dict:
     prompt = ChatPromptTemplate.from_messages([
         (
             "system",
-            "Extract meeting schedule details from this email. "
-            "Convert relative dates (e.g., 'this Monday at 4 PM') to valid ISO 8601 strings with timezone +05:30. "
-            "Base reference year is 2026. If the email doesn't contain a specific time proposal, return confidence 0.0.",
+            "Extract only meeting details supported by the email. Use Asia/Kolkata "
+            "when the email gives a time without a timezone; honor any explicitly "
+            "stated timezone. Resolve relative dates using the email received-at "
+            "timestamp provided below, not an assumed current date or year. "
+            "If the date, start time, end time, or duration is missing or ambiguous, "
+            "set confidence to 0.0 and return empty strings for both timestamps. "
+            "Do not invent a date, midnight time, end time, or default duration. "
+            "Otherwise return ISO 8601 timestamps with explicit timezone offsets.",
         ),
-        ("human", "Sender: {sender}\nSubject: {subject}\nBody:\n{body}"),
+        (
+            "human",
+            "Email received at: {email_received_at}\n"
+            "Sender: {sender}\nSubject: {subject}\nBody:\n{body}",
+        ),
     ])
 
     structured_llm = llm.with_structured_output(CalendarEventDraft)
@@ -127,6 +154,7 @@ def scheduler_node(state: EmailAgentState) -> dict:
         "sender": state["sender"],
         "subject": state["subject"],
         "body": state["body"],
+        "email_received_at": email_received_at or "unknown",
     })
 
     return {"calendar_event": result.model_dump()}

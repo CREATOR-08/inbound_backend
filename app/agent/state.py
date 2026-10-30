@@ -14,10 +14,14 @@ class TriageOutput(BaseModel):
 
 class CalendarEventDraft(BaseModel):
     title: str = Field(description="Summary title of the meeting.")
-    start_time: str = Field(description="ISO 8601 formatted datetime string (e.g. 2026-10-26T15:00:00+05:30).")
-    end_time: str = Field(description="ISO 8601 formatted datetime string.")
+    start_time: str = Field(description="ISO 8601 datetime string, or empty if the date/time is ambiguous.")
+    end_time: str = Field(description="ISO 8601 datetime string, or empty if the date/time is ambiguous.")
     attendees: List[str] = Field(default_factory=list, description="Email addresses of attendees.")
-    confidence: float = Field(ge=0.0, le=1.0, description="Confidence in the extracted scheduling info.")
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Use 0.0 when the email does not support complete, unambiguous event times.",
+    )
 
 class ReplyDraftOutput(BaseModel):
     reply_outline: List[str] = Field(description="Key bullet points to address in response.")

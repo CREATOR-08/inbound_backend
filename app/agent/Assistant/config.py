@@ -11,7 +11,7 @@ load_dotenv()
 
 ModelTask = Literal["fast", "reasoning"]
 DEFAULT_FAST_MODEL = "gemini-3.5-flash-lite"
-DEFAULT_REASONING_MODEL = "gemini-3.8-flash"
+DEFAULT_REASONING_MODEL = "gemini-3.5-flash-lite"
 
 
 @lru_cache(maxsize=2)

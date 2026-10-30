@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -192,6 +193,166 @@ class AssistantGraphTests(unittest.TestCase):
             })
         self.assertEqual(update["response"]["status"], "unsupported")
         self.assertIsNone(update.get("query_spec"))
+
+    def test_email_query_schema_matches_model_columns_and_allowlist(self):
+        description = nodes.describe_email_query_schema()
+        columns = {column["name"]: column for column in description["columns"]}
+
+        self.assertEqual(set(columns), {column.name for column in Email.__table__.columns})
+        for model_column in Email.__table__.columns:
+            description_column = columns[model_column.name]
+            self.assertEqual(description_column["type"], repr(model_column.type))
+            self.assertEqual(description_column["nullable"], model_column.nullable)
+            self.assertEqual(description_column["primary_key"], model_column.primary_key)
+            self.assertIn("meaning", description_column)
+
+        query_fields = description["query_spec"]["query_fields"]
+        self.assertEqual(
+            set(query_fields),
+            {"sender", "subject", "priority", "category", "received_at", "is_archived"},
+        )
+        self.assertEqual(query_fields["sender"]["operators"], ["eq", "contains", "in"])
+        self.assertEqual(query_fields["subject"]["operators"], ["eq", "contains", "in"])
+        self.assertEqual(query_fields["priority"]["operators"], ["eq", "in"])
+        self.assertEqual(query_fields["category"]["operators"], ["eq", "in"])
+        self.assertEqual(
+            query_fields["received_at"]["operators"],
+            ["eq", "gt", "gte", "lt", "lte", "between"],
+        )
+        self.assertEqual(query_fields["is_archived"]["operators"], ["eq", "in"])
+        self.assertEqual(query_fields["priority"]["allowed_values"], ["HIGH", "MEDIUM", "LOW"])
+        self.assertEqual(
+            query_fields["category"]["allowed_values"],
+            ["MEETING_REQUEST", "ACTION_REQUIRED", "INFORMATIONAL", "SPAM"],
+        )
+        self.assertEqual(query_fields["received_at"]["model_column"], "created_at")
+        self.assertIn("email_agent_states.category", query_fields["category"]["effective_value"])
+        self.assertIn("email_agent_states.priority", query_fields["priority"]["effective_value"])
+        self.assertTrue(columns["created_at"]["queryable"])
+        self.assertEqual(columns["created_at"]["query_field"], "received_at")
+
+    def test_email_query_schema_marks_unsupported_model_fields_non_queryable(self):
+        description = nodes.describe_email_query_schema()
+        columns = {column["name"]: column for column in description["columns"]}
+        query_fields = description["query_spec"]["query_fields"]
+
+        for name in ("id", "thread_id", "user_id", "preview", "body", "body_html", "has_html"):
+            self.assertFalse(columns[name]["queryable"], name)
+        self.assertNotIn("urgency", columns)
+        self.assertNotIn("requires_action", columns)
+        self.assertNotIn("urgency", query_fields)
+        self.assertNotIn("requires_action", query_fields)
+        self.assertFalse(columns["user_id"]["queryable"])
+        self.assertIn("authenticated identity", columns["user_id"]["meaning"])
+
+    def test_query_planner_prompt_receives_schema_and_field_semantics(self):
+        plan = nodes.DataQueryPlan(
+            source="local_email_store",
+            query=EmailQuerySpec(),
+            message="Searching locally stored emails.",
+        )
+        with (
+            patch.object(nodes, "_invoke_structured", return_value=plan) as model,
+            patch.object(nodes, "search_emails", return_value={"items": [], "total": 0}),
+        ):
+            nodes.plan_data_query({"user_id": "user-1", "message": "Show emails"})
+
+        prompt = model.call_args.args[2]
+        self.assertIn(
+            json.dumps(nodes.describe_email_query_schema(), ensure_ascii=False),
+            prompt,
+        )
+        self.assertIn("ACTION_REQUIRED is a supported category value, never a priority value", prompt)
+        self.assertIn("Urgency and requires_action are not Email columns", prompt)
+        self.assertIn("Do not include user_id", prompt)
+        self.assertIn("Do not generate SQL", prompt)
+        self.assertIn("request clarification", prompt)
+        self.assertIn("Do not claim that matching emails exist", prompt)
+
+    def test_query_planner_uses_priority_field_for_high_priority(self):
+        query = EmailQuerySpec(
+            filters=[EmailFilter(field="priority", operator="eq", value="HIGH")]
+        )
+        plan = nodes.DataQueryPlan(
+            source="local_email_store",
+            query=query,
+            message="Searching locally stored emails.",
+        )
+        with (
+            patch.object(nodes, "_invoke_structured", return_value=plan),
+            patch.object(nodes, "search_emails", return_value={"items": [], "total": 0}),
+        ):
+            update = nodes.plan_data_query({
+                "user_id": "user-1",
+                "message": "Show high-priority emails",
+            })
+
+        self.assertEqual(
+            update["query_spec"]["filters"],
+            [{"field": "priority", "operator": "eq", "value": "HIGH"}],
+        )
+        EmailQuerySpec.model_validate(update["query_spec"])
+
+    def test_query_planner_uses_category_for_action_required_emails(self):
+        query = EmailQuerySpec(
+            filters=[EmailFilter(field="category", operator="eq", value="ACTION_REQUIRED")]
+        )
+        plan = nodes.DataQueryPlan(
+            source="local_email_store",
+            query=query,
+            message="Searching locally stored emails.",
+        )
+        with (
+            patch.object(nodes, "_invoke_structured", return_value=plan),
+            patch.object(nodes, "search_emails", return_value={"items": [], "total": 0}),
+        ):
+            update = nodes.plan_data_query({
+                "user_id": "user-1",
+                "message": "Show action-required emails",
+            })
+
+        self.assertEqual(
+            update["query_spec"]["filters"],
+            [{"field": "category", "operator": "eq", "value": "ACTION_REQUIRED"}],
+        )
+        self.assertNotEqual(update["query_spec"]["filters"][0]["field"], "priority")
+
+    def test_query_planner_does_not_invent_urgency_field(self):
+        plan = nodes.DataQueryPlan(
+            source="local_email_store",
+            query=EmailQuerySpec(),
+            message="Urgency is not supported as an email query field.",
+            unsupported_features=["urgency"],
+            requires_clarification=True,
+        )
+        with (
+            patch.object(nodes, "_invoke_structured", return_value=plan),
+            patch.object(nodes, "search_emails") as search,
+        ):
+            update = nodes.plan_data_query({
+                "user_id": "user-1",
+                "message": "Show urgent emails",
+            })
+
+        self.assertEqual(update["response"]["status"], "unsupported")
+        self.assertTrue(update["response"]["requires_clarification"])
+        search.assert_not_called()
+
+    def test_query_validation_rejects_unsupported_priority_and_urgency(self):
+        with self.assertRaises(ValueError):
+            EmailFilter.model_validate({
+                "field": "priority",
+                "operator": "eq",
+                "value": "ACTION_REQUIRED",
+            })
+        with self.assertRaises(ValueError):
+            EmailFilter.model_validate({
+                "field": "urgency",
+                "operator": "eq",
+                "value": "HIGH",
+            })
+        with self.assertRaises(ValueError):
+            EmailQuerySpec.model_validate({"user_id": "another-user"})
 
     def test_unread_request_is_rejected_without_query_model_call(self):
         with patch.object(nodes, "_invoke_structured") as model:
