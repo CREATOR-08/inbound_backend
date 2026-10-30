@@ -1,3 +1,14 @@
+
+import logging
+
+from fastapi import APIRouter, Depends, Header, HTTPException
+from google.auth.exceptions import GoogleAuthError
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from sqlalchemy.orm import Session
+
 from app.agent.nodes import scheduler_node
 from app.api.dependencies import _get_bearer_token, _resolve_user_account
 from app.api.routes.common import (
@@ -11,9 +22,8 @@ from app.services.calendar import (
     create_google_calendar_event,
     normalize_calendar_event_times,
 )
-from fastapi import APIRouter, Depends, Header, HTTPException
-from sqlalchemy.orm import Session
 
+logger = logging.getLogger(__name__)
 action_router = APIRouter()
 
 SCHEDULE_AMBIGUITY_MESSAGE = (
@@ -21,9 +31,18 @@ SCHEDULE_AMBIGUITY_MESSAGE = (
     "Enter the start and end times manually to continue."
 )
 
+CALENDAR_PERMISSION_MESSAGE = (
+    "Google Calendar permission is missing. "
+    "Reconnect your Google account and grant Calendar access."
+)
 
-def _schedule_proposal_times(event: dict) -> tuple[str, str, float, str | None]:
+
+def _schedule_proposal_times(
+    event: dict,
+) -> tuple[str, str, float, str | None]:
+    """Validate and normalize proposed event times."""
     confidence = float(event.get("confidence", 0.0))
+
     if confidence <= 0:
         return "", "", confidence, SCHEDULE_AMBIGUITY_MESSAGE
 
@@ -31,7 +50,65 @@ def _schedule_proposal_times(event: dict) -> tuple[str, str, float, str | None]:
         event["start_time"],
         event["end_time"],
     )
+
     return start_time, end_time, confidence, None
+
+
+def _check_calendar_access(access_token: str) -> None:
+    """
+    Verify that the current Google access token can access Calendar.
+
+    This allows /schedule to detect missing Calendar permissions before
+    generating and saving a calendar draft.
+    """
+    credentials = Credentials(token=access_token)
+
+    try:
+        calendar_service = build(
+            "calendar",
+            "v3",
+            credentials=credentials,
+            cache_discovery=False,
+        )
+
+        # A lightweight read request verifies Calendar API access.
+        calendar_service.calendarList().list(maxResults=1).execute()
+
+    except HttpError as exc:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+
+        if status in (401, 403):
+            logger.warning(
+                "Google Calendar access check failed with HTTP %s",
+                status,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=CALENDAR_PERMISSION_MESSAGE,
+            ) from exc
+
+        logger.exception("Google Calendar access check failed")
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to verify Google Calendar access. Please try again.",
+        ) from exc
+
+    except GoogleAuthError as exc:
+        logger.warning("Google credentials could not be used for Calendar access")
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Your Google access token is invalid or expired. "
+                "Reconnect your Google account and try again."
+            ),
+        ) from exc
+
+    except Exception as exc:
+        logger.exception("Unexpected error while checking Calendar access")
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to verify Google Calendar access. Please try again.",
+        ) from exc
 
 
 @action_router.post("/schedule")
@@ -40,29 +117,78 @@ def generate_schedule(
     authorization: str = Header(...),
     db: Session = Depends(get_db),
 ):
-    """Extract a calendar proposal for user review without creating an event."""
-    user, _ = _resolve_user_account(_get_bearer_token(authorization), db)
-    db.commit()
+    """
+    Verify Calendar access, extract a calendar proposal, and save a draft.
+    This endpoint does not create a Google Calendar event.
+    """
+    user, token = _resolve_user_account(
+        _get_bearer_token(authorization),
+        db,
+    )
+
+    # AUTH-08: fail early if the user has not granted Calendar access.
+    _check_calendar_access(token)
+
     email, _ = _get_email_action_state(req.email_id, user.id, db)
     action_state = _build_action_state(email)
+
     email_id = email.id
     email_subject = email.subject
-    email_received_at = email.created_at.isoformat() if email.created_at else None
+    email_received_at = (
+        email.created_at.isoformat() if email.created_at else None
+    )
+
+    # Avoid keeping the request's DB session open while the AI runs.
     db.close()
-    result = scheduler_node(action_state, email_received_at)
-    event = result["calendar_event"]
+
+    # Generate the proposal exactly once.
     try:
-        start_time, end_time, confidence, ambiguity = _schedule_proposal_times(event)
-    except ValueError as exc:
+        result = scheduler_node(action_state, email_received_at)
+
+        event = result.get("calendar_event") if isinstance(result, dict) else None
+
+        if not isinstance(event, dict):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Schedule extraction failed to produce a valid "
+                    "calendar proposal."
+                ),
+            )
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        logger.exception(
+            "Schedule generation failed for email %s",
+            req.email_id,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to generate the meeting schedule. Please try again.",
+        ) from exc
+
+    try:
+        start_time, end_time, confidence, ambiguity = (
+            _schedule_proposal_times(event)
+        )
+
+    except (ValueError, KeyError, TypeError) as exc:
+        logger.warning(
+            "Schedule extraction returned invalid event data for email %s",
+            req.email_id,
+        )
         raise HTTPException(
             status_code=502,
             detail="Schedule extraction returned invalid event times.",
         ) from exc
 
-    db = SessionLocal()
+    draft_db = SessionLocal()
+
     try:
         draft = (
-            db.query(CalendarDraft)
+            draft_db.query(CalendarDraft)
             .join(Email, Email.id == CalendarDraft.email_id)
             .filter(
                 CalendarDraft.email_id == email_id,
@@ -70,35 +196,39 @@ def generate_schedule(
             )
             .first()
         )
+
         if draft and draft.status == "APPROVED":
             raise HTTPException(
                 status_code=409,
-                detail="A calendar event has already been approved for this email",
+                detail="A calendar event has already been approved for this email.",
             )
 
         title = event.get("title") or email_subject or "Meeting"
+        attendees = event.get("attendees") or []
+
         if draft is None:
             draft = CalendarDraft(
                 email_id=email_id,
                 title=title,
                 start_time=start_time,
                 end_time=end_time,
-                attendees=event.get("attendees") or [],
+                attendees=attendees,
                 confidence=str(confidence),
                 status="PENDING",
             )
-            db.add(draft)
+            draft_db.add(draft)
         else:
             draft.title = title
             draft.start_time = start_time
             draft.end_time = end_time
-            draft.attendees = event.get("attendees") or []
+            draft.attendees = attendees
             draft.confidence = str(confidence)
             draft.status = "PENDING"
 
-        db.commit()
-        db.refresh(draft)
-        response = {
+        draft_db.commit()
+        draft_db.refresh(draft)
+
+        return {
             "confirmation_required": True,
             "calendar_event": {
                 "draft_id": str(draft.id),
@@ -111,9 +241,24 @@ def generate_schedule(
                 "status": draft.status,
             },
         }
-        return response
+
+    except HTTPException:
+        draft_db.rollback()
+        raise
+
+    except Exception as exc:
+        draft_db.rollback()
+        logger.exception(
+            "Failed to save calendar draft for email %s",
+            req.email_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to save the calendar proposal. Please try again.",
+        ) from exc
+
     finally:
-        db.close()
+        draft_db.close()
 
 
 @action_router.post("/calendar/confirm")
@@ -122,9 +267,11 @@ def confirm_calendar_event(
     authorization: str = Header(...),
     db: Session = Depends(get_db),
 ):
-    """HITL Gate: Pushes the drafted event to Google Calendar once user approves."""
-    user, token = _resolve_user_account(_get_bearer_token(authorization), db)
-    db.commit()
+    """Create a Google Calendar event only after explicit user approval."""
+    user, token = _resolve_user_account(
+        _get_bearer_token(authorization),
+        db,
+    )
 
     draft = (
         db.query(CalendarDraft)
@@ -135,33 +282,51 @@ def confirm_calendar_event(
         )
         .first()
     )
+
     if not draft:
-        raise HTTPException(status_code=404, detail="Draft not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Draft not found.",
+        )
 
     if draft.status == "APPROVED":
-        return {"status": "already_approved", "google_event_id": draft.google_event_id}
+        return {
+            "status": "already_approved",
+            "google_event_id": draft.google_event_id,
+        }
 
     title = req.title or draft.title
     start_time = req.start_time or draft.start_time
     end_time = req.end_time or draft.end_time
 
-    if not title.strip():
+    if not title or not title.strip():
         raise HTTPException(
             status_code=422,
-            detail="A title and ISO 8601 start_time/end_time are required",
+            detail="A title and ISO 8601 start_time/end_time are required.",
         )
+
     try:
-        start_time, end_time = normalize_calendar_event_times(start_time, end_time)
-    except ValueError as exc:
+        start_time, end_time = normalize_calendar_event_times(
+            start_time,
+            end_time,
+        )
+    except (ValueError, TypeError) as exc:
         raise HTTPException(
             status_code=422,
             detail=str(exc),
         ) from exc
 
+    draft_id = draft.id
+    attendees = (
+        req.attendees
+        if req.attendees is not None
+        else draft.attendees
+    )
+
+    # Close the original session before making the external API request.
+    db.close()
+
     try:
-        draft_id = draft.id
-        attendees = req.attendees if req.attendees is not None else draft.attendees
-        db.close()
         created = create_google_calendar_event(
             access_token=token,
             title=title,
@@ -170,28 +335,82 @@ def confirm_calendar_event(
             attendees=attendees,
         )
 
-        db = SessionLocal()
+        # Reopen a session to persist the result.
+        update_db = SessionLocal()
+
         try:
             persisted_draft = (
-                db.query(CalendarDraft)
+                update_db.query(CalendarDraft)
                 .join(Email, Email.id == CalendarDraft.email_id)
-                .filter(CalendarDraft.id == draft_id, Email.user_id == user.id)
+                .filter(
+                    CalendarDraft.id == draft_id,
+                    Email.user_id == user.id,
+                )
                 .first()
             )
+
             if persisted_draft is None:
-                raise RuntimeError("Calendar draft disappeared after event creation.")
+                raise RuntimeError(
+                    "Calendar draft disappeared after event creation."
+                )
+
             persisted_draft.title = title
             persisted_draft.start_time = start_time
             persisted_draft.end_time = end_time
             persisted_draft.attendees = attendees
             persisted_draft.status = "APPROVED"
             persisted_draft.google_event_id = created.get("id")
-            db.commit()
-            google_event_id = persisted_draft.google_event_id
-        finally:
-            db.close()
 
-        return {"status": "success", "google_event_id": google_event_id}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Google Calendar Error: {str(e)}")
+            update_db.commit()
+            google_event_id = persisted_draft.google_event_id
+
+        except Exception:
+            update_db.rollback()
+            raise
+
+        finally:
+            update_db.close()
+
+        return {
+            "status": "success",
+            "google_event_id": google_event_id,
+        }
+
+    except HTTPException:
+        raise
+
+    except HttpError as exc:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+
+        if status in (401, 403):
+            logger.warning(
+                "Google Calendar event creation denied with HTTP %s",
+                status,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=CALENDAR_PERMISSION_MESSAGE,
+            ) from exc
+
+        logger.exception("Google Calendar API request failed")
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to create the calendar event. Please try again.",
+        ) from exc
+
+    except GoogleAuthError as exc:
+        logger.warning("Google credentials failed during Calendar event creation")
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Your Google access token is invalid or expired. "
+                "Reconnect your Google account and try again."
+            ),
+        ) from exc
+
+    except Exception as exc:
+        logger.exception("Unable to confirm calendar event")
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to confirm the calendar event. Please try again.",
+        ) from exc

@@ -2,13 +2,15 @@ import logging
 from dataclasses import dataclass
 from time import perf_counter
 
-from app.db.database import SessionLocal
-from app.db.models import UserAccount
-from app.services.gmail import get_gmail_service_from_token
+import google.auth.exceptions
 from fastapi import Header, HTTPException
 from googleapiclient.errors import HttpError
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+
+from app.db.database import SessionLocal
+from app.db.models import UserAccount
+from app.services.gmail import get_gmail_service_from_token
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +30,22 @@ class AuthenticatedUser:
     refresh_token: str | None
 
 
-def _get_bearer_token(authorization: str) -> str:
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token.strip():
-        raise HTTPException(status_code=401, detail="Invalid token header format")
-    return token.strip()
+def _get_bearer_token(authorization: str | None) -> str:
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Authorization header.",
+        )
 
+    scheme, _, token = authorization.partition(" ")
+
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid Authorization header.",
+        )
+
+    return token.strip()
 
 def _resolve_user_account(
     access_token: str,
@@ -46,18 +58,40 @@ def _resolve_user_account(
         service, active_token = get_gmail_service_from_token(access_token)
         profile = service.users().getProfile(userId="me").execute()
         google_profile_ms = (perf_counter() - google_profile_started) * 1000
+
     except HttpError as error:
         status = getattr(getattr(error, "resp", None), "status", None)
         logger.info("Google rejected Gmail authentication with status %s", status)
+
+        if status in (401, 403):
+            raise HTTPException(
+                status_code=401 if status == 401 else 403,
+                detail="Invalid or expired Google access token."
+            ) from error
+
         raise HTTPException(
-            status_code=status if status in (401, 403) else 502,
+            status_code=502,
             detail="Unable to authenticate this Gmail account.",
+        ) from error
+
+    except (
+        google.auth.exceptions.RefreshError,
+        google.auth.exceptions.GoogleAuthError,
+    ) as error:
+        logger.info(
+            "Google authentication failed: %s",
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired Google access token.",
         ) from error
 
     user_email = profile.get("emailAddress")
     if not user_email:
         raise HTTPException(
-            status_code=401, detail="Google did not return a Gmail account."
+            status_code=401,
+            detail="Google did not return a Gmail account.",
         )
 
     account_lookup_started = perf_counter()
@@ -67,6 +101,7 @@ def _resolve_user_account(
         .first()
     )
     account_lookup_ms = (perf_counter() - account_lookup_started) * 1000
+
     if timing_context:
         logger.info(
             "%s_auth_timing google_profile_ms=%.1f account_lookup_ms=%.1f",
@@ -74,9 +109,14 @@ def _resolve_user_account(
             google_profile_ms,
             account_lookup_ms,
         )
+
     if user is None:
         if not create:
-            raise HTTPException(status_code=404, detail="Gmail account not found.")
+            raise HTTPException(
+                status_code=404,
+                detail="Gmail account not found.",
+            )
+
         user = UserAccount(
             id=user_email.lower(),
             email=user_email,
@@ -88,7 +128,6 @@ def _resolve_user_account(
         user.access_token = active_token
 
     return user, active_token
-
 
 
 def get_current_user(

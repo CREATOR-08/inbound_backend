@@ -3,7 +3,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from time import perf_counter
-
+from googleapiclient.errors import HttpError
 from app.agent.graph import triage_graph
 from app.agent.nodes import stream_draft_reply
 from app.api.dependencies import _get_bearer_token, _resolve_user_account
@@ -49,9 +49,7 @@ def _watch_is_active(expiration: str | None) -> bool:
         return False
 
 
-def _ensure_gmail_watch(
-    user: UserAccount, access_token: str
-) -> dict[str, str]:
+def _ensure_gmail_watch(user: UserAccount, access_token: str) -> dict[str, str]:
     if user.last_history_id and _watch_is_active(user.watch_expiration):
         return {
             "historyId": user.last_history_id,
@@ -74,9 +72,7 @@ def _latest_history_id(*history_ids: str | None) -> str | None:
     return max(valid_ids, key=int) if valid_ids else None
 
 
-def _store_email_if_new(
-    db: Session, user: UserAccount, email_data: dict
-) -> bool:
+def _store_email_if_new(db: Session, user: UserAccount, email_data: dict) -> bool:
     email_values = {
         "id": email_data["id"],
         "thread_id": email_data["thread_id"],
@@ -102,14 +98,17 @@ def _store_email_if_new(
                     "Gmail message ID collision across accounts; refusing to reassign it"
                 )
             return False
-        db.add(
-            EmailAgentStateModel(
+        db.execute(
+            postgresql_insert(EmailAgentStateModel)
+            .values(
                 email_id=email_data["id"],
                 category=None,
                 priority=None,
                 is_archived=False,
             )
+            .on_conflict_do_nothing(index_elements=[EmailAgentStateModel.email_id])
         )
+
         return True
 
     existing = db.query(Email).filter(Email.id == email_data["id"]).first()
@@ -192,7 +191,9 @@ def tag_recent_untagged_emails(user_id: str, limit: int = 10) -> None:
             if category not in VALID_CATEGORIES or priority not in VALID_PRIORITIES:
                 raise ValueError("Triage returned an invalid category or priority")
         except Exception:
-            logger.exception("Failed to tag email_id=%s for user_id=%s", email_id, user_id)
+            logger.exception(
+                "Failed to tag email_id=%s for user_id=%s", email_id, user_id
+            )
             continue
 
         db = SessionLocal()
@@ -247,6 +248,7 @@ def register_watch(
 
     try:
         user, active_token = _resolve_user_account(token, db, create=True)
+        db.commit()
         user_id = user.id
         watch_user = UserAccount(
             id=user_id,
@@ -259,9 +261,7 @@ def register_watch(
         storage_db = SessionLocal()
         try:
             stored_user = (
-                storage_db.query(UserAccount)
-                .filter(UserAccount.id == user_id)
-                .one()
+                storage_db.query(UserAccount).filter(UserAccount.id == user_id).one()
             )
             stored_user.last_history_id = watch_res["historyId"]
             stored_user.watch_expiration = watch_res["expiration"]
@@ -443,7 +443,10 @@ def process_realtime_email_update(email_address: str, pushed_history_id: str):
     try:
         user = db.query(UserAccount).filter(UserAccount.id == user_id).first()
         if user is None:
-            logger.warning("Account disappeared while processing Gmail update for %s", email_address)
+            logger.warning(
+                "Account disappeared while processing Gmail update for %s",
+                email_address,
+            )
             return
         user.access_token = active_token
         user.last_history_id = _latest_history_id(user.last_history_id, latest_id)
@@ -526,25 +529,23 @@ def get_emails(
     response = []
 
     for e in emails:
-        response.append({
-            "id": e.id,
-            "thread_id": e.thread_id,
-            "sender": e.sender,
-            "subject": e.subject,
-            "preview": e.preview or "",
-            "received_at": e.created_at.isoformat() if e.created_at else None,
-            "category": (
-                e.state.category if e.state else e.category
-            ),
-            "priority": (
-                e.state.priority if e.state else e.priority
-            ),
-            "is_archived": (
-                e.state.is_archived
-                if e.state and e.state.is_archived is not None
-                else bool(e.is_archived)
-            ),
-        })
+        response.append(
+            {
+                "id": e.id,
+                "thread_id": e.thread_id,
+                "sender": e.sender,
+                "subject": e.subject,
+                "preview": e.preview or "",
+                "received_at": e.created_at.isoformat() if e.created_at else None,
+                "category": (e.state.category if e.state else e.category),
+                "priority": (e.state.priority if e.state else e.priority),
+                "is_archived": (
+                    e.state.is_archived
+                    if e.state and e.state.is_archived is not None
+                    else bool(e.is_archived)
+                ),
+            }
+        )
 
     return {"data": response}
 
@@ -564,9 +565,7 @@ def get_email_body(
     database_started = perf_counter()
     db.commit()
     email = (
-        db.query(Email)
-        .filter(Email.id == email_id, Email.user_id == user.id)
-        .first()
+        db.query(Email).filter(Email.id == email_id, Email.user_id == user.id).first()
     )
     database_ms = (perf_counter() - database_started) * 1000
     logger.info(
@@ -614,7 +613,9 @@ def generate_draft(
                     .first()
                 )
                 if persisted_state is None:
-                    raise RuntimeError("Email triage state disappeared during drafting.")
+                    raise RuntimeError(
+                        "Email triage state disappeared during drafting."
+                    )
                 persisted_state.reply_outline = []
                 persisted_state.suggested_reply = "".join(generated)
                 persistence_db.commit()
@@ -664,8 +665,38 @@ def send_reply(
             refresh_token=refresh_token,
         )
         return {"status": "sent", "message_id": sent_id}
+    # except ValueError as e:
+    #     raise HTTPException(status_code=422, detail=str(e))
+    # except Exception as e:
+    #     logger.exception("Unable to send reply for email %s", email_id)
+    #     raise HTTPException(status_code=502, detail=f"Unable to send reply: {str(e)}")
     except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+        raise HTTPException(
+            status_code=422,
+            detail=str(e),
+        ) from e
+
+    except HttpError as e:
+        status = getattr(getattr(e, "resp", None), "status", None)
+
+        if status == 403:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Gmail permission is missing. Reconnect your Google "
+                    "account and grant permission to send emails."
+                ),
+            ) from e
+
+        logger.exception("Unable to send reply for email %s", email_id)
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to send your reply. Please try again.",
+        ) from e
+
     except Exception as e:
         logger.exception("Unable to send reply for email %s", email_id)
-        raise HTTPException(status_code=502, detail=f"Unable to send reply: {str(e)}")
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to send your reply. Please try again.",
+        ) from e
