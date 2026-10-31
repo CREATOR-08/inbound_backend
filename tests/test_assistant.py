@@ -511,13 +511,15 @@ class AssistantGraphTests(unittest.TestCase):
 
 
 class AssistantApiTests(unittest.TestCase):
-    def test_auth_database_session_starts_after_google_call_and_closes(self):
+    def test_auth_loads_stored_credentials_and_closes_database_sessions(self):
         events = []
 
         class FakeUser:
             id = "u1"
             email = "user@example.com"
             refresh_token = "refresh"
+            access_token = "******"
+            token_expiry = None
 
         class FakeSession:
             def query(self, model):
@@ -533,6 +535,9 @@ class AssistantApiTests(unittest.TestCase):
 
             def close(self):
                 events.append("session_closed")
+
+            def commit(self):
+                pass
 
         class FakeRequest:
             def execute(self):
@@ -555,13 +560,22 @@ class AssistantApiTests(unittest.TestCase):
         with (
             patch.object(
                 dependencies,
-                "get_gmail_service_from_token",
-                return_value=(FakeService(), "active"),
+                "get_gmail_service_with_token_state",
+                return_value=(FakeService(), "active", None),
             ),
             patch.object(dependencies, "SessionLocal", side_effect=session_factory),
         ):
             user = dependencies.get_current_user("Bearer token")
-        self.assertEqual(events, ["google_profile", "session_created", "session_closed"])
+        self.assertEqual(
+            events,
+            [
+                "session_created",
+                "session_closed",
+                "google_profile",
+                "session_created",
+                "session_closed",
+            ],
+        )
         self.assertEqual(user.id, "u1")
         self.assertEqual(user.access_token, "active")
 

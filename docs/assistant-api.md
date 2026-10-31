@@ -213,6 +213,11 @@ populate local data.
 
 ## Frontend behavior
 
+- Start the initial Gmail import with `POST /api/v1/emails/sync-initial`.
+  The endpoint returns `202 Accepted` with status `pending` (or `running` if
+  an import is already queued). Poll
+  `GET /api/v1/emails/sync-initial/status` for `not_started`, `pending`,
+  `running`, `completed`, or `failed`; refresh the inbox after it completes.
 - Send the Google bearer token in `Authorization`; do not provide a user ID.
 - For `DATA_QUERY`, render `data.items` as email cards. When
   `data.next_offset` is non-null, request the next page with message `"next

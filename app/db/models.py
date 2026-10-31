@@ -19,6 +19,7 @@ class UserAccount(Base):
     # Gmail Pub/Sub sync state
     last_history_id = Column(String(64), nullable=True)
     watch_expiration = Column(String(64), nullable=True)
+    initial_sync_status = Column(String(16), nullable=True)
     initial_sync_completed_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())

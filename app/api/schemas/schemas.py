@@ -53,7 +53,18 @@ class PubSubPushRequest(BaseModel):
 
 
 class InitialSyncResponse(BaseModel):
-    status: Literal["completed", "already_completed"]
+    status: Literal[
+        "pending",
+        "running",
+        "completed",
+        "already_completed",
+        "failed",
+    ]
     imported_count: int
     skipped_count: int
     history_id: str
+
+
+class InitialSyncStatusResponse(BaseModel):
+    status: Literal["not_started", "pending", "running", "completed", "failed"]
+    history_id: Optional[str] = None

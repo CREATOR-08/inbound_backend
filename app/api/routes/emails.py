@@ -1,9 +1,17 @@
 import base64
+import binascii
 import json
 import logging
 from datetime import datetime, timezone
 from time import perf_counter
+
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Response
+from fastapi.responses import StreamingResponse
 from googleapiclient.errors import HttpError
+from sqlalchemy import func, or_
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.orm import Session, joinedload, load_only
+
 from app.agent.graph import triage_graph
 from app.agent.nodes import stream_draft_reply
 from app.api.dependencies import _get_bearer_token, _resolve_user_account
@@ -17,22 +25,21 @@ from app.api.schemas.schemas import (
     EmailActionRequest,
     EmailSendRequest,
     InitialSyncResponse,
+    InitialSyncStatusResponse,
     PubSubPushRequest,
 )
 from app.db.database import SessionLocal, get_db
 from app.db.models import Email, EmailAgentStateModel, UserAccount
 from app.services.gmail import (
+    GmailReauthorizationRequired,
+    TokenRefreshCallback,
     fetch_new_message_ids_from_history,
     fetch_single_email,
+    get_gmail_service_with_token_state,
     list_message_ids,
     send_email_reply,
     start_gmail_watch,
 )
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Response
-from fastapi.responses import StreamingResponse
-from sqlalchemy import func, or_
-from sqlalchemy.dialects.postgresql import insert as postgresql_insert
-from sqlalchemy.orm import Session, joinedload, load_only
 
 logger = logging.getLogger(__name__)
 
@@ -49,14 +56,23 @@ def _watch_is_active(expiration: str | None) -> bool:
         return False
 
 
-def _ensure_gmail_watch(user: UserAccount, access_token: str) -> dict[str, str]:
+def _ensure_gmail_watch(
+    user: UserAccount,
+    access_token: str,
+    on_token_refresh: TokenRefreshCallback | None = None,
+) -> dict[str, str]:
     if user.last_history_id and _watch_is_active(user.watch_expiration):
         return {
             "historyId": user.last_history_id,
             "expiration": user.watch_expiration or "",
         }
 
-    result = start_gmail_watch(access_token, user.refresh_token)
+    result = start_gmail_watch(
+        access_token,
+        user.refresh_token,
+        token_expiry=user.token_expiry,
+        on_token_refresh=on_token_refresh,
+    )
     history_id = result.get("historyId")
     expiration = result.get("expiration")
     if not history_id or not expiration:
@@ -70,6 +86,29 @@ def _ensure_gmail_watch(user: UserAccount, access_token: str) -> dict[str, str]:
 def _latest_history_id(*history_ids: str | None) -> str | None:
     valid_ids = [history_id for history_id in history_ids if history_id]
     return max(valid_ids, key=int) if valid_ids else None
+
+
+def _persist_gmail_token_state(
+    user_id: str,
+    access_token: str,
+    token_expiry: datetime | None,
+    refresh_token: str | None = None,
+) -> None:
+    db = SessionLocal()
+    try:
+        user = db.query(UserAccount).filter(UserAccount.id == user_id).first()
+        if user is None:
+            raise RuntimeError("Gmail account disappeared while saving credentials.")
+        user.access_token = access_token
+        user.token_expiry = token_expiry
+        if refresh_token:
+            user.refresh_token = refresh_token
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def _store_email_if_new(db: Session, user: UserAccount, email_data: dict) -> bool:
@@ -253,6 +292,7 @@ def register_watch(
         watch_user = UserAccount(
             id=user_id,
             refresh_token=user.refresh_token,
+            token_expiry=user.token_expiry,
             last_history_id=user.last_history_id,
             watch_expiration=user.watch_expiration,
         )
@@ -280,20 +320,204 @@ def register_watch(
         ) from e
 
 
-@router.post("/emails/sync-initial", response_model=InitialSyncResponse)
+def _mark_initial_sync_failed(user_id: str) -> None:
+    db: Session = SessionLocal()
+    try:
+        user = db.query(UserAccount).filter(UserAccount.id == user_id).first()
+        if user is not None and user.initial_sync_completed_at is None:
+            user.initial_sync_status = "failed"
+            db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def run_initial_gmail_sync(user_id: str) -> None:
+    """Run the initial Gmail import using worker-owned database sessions."""
+    try:
+        db: Session = SessionLocal()
+        try:
+            user = db.query(UserAccount).filter(UserAccount.id == user_id).first()
+            if user is None:
+                raise RuntimeError("Gmail account disappeared before synchronization.")
+            if user.initial_sync_completed_at:
+                user.initial_sync_status = "completed"
+                db.commit()
+                return
+            if user.initial_sync_status != "pending":
+                return
+
+            active_token = user.access_token
+            refresh_token = user.refresh_token
+            token_expiry = user.token_expiry
+            if not isinstance(active_token, str) or not active_token:
+                raise RuntimeError("Gmail account has no access token.")
+            if refresh_token is not None and not isinstance(refresh_token, str):
+                raise RuntimeError("Gmail account has an invalid refresh token.")
+            if token_expiry is not None and not isinstance(token_expiry, datetime):
+                raise RuntimeError("Gmail account has an invalid token expiry.")
+            watch_user = UserAccount(
+                id=user.id,
+                refresh_token=refresh_token,
+                token_expiry=token_expiry,
+                last_history_id=user.last_history_id,
+                watch_expiration=user.watch_expiration,
+            )
+            user.initial_sync_status = "running"
+            db.commit()
+        finally:
+            db.close()
+
+        token_state = {"access_token": active_token, "expiry": token_expiry}
+
+        def persist_refreshed_token(
+            refreshed_access_token: str,
+            expiry: datetime | None,
+            refreshed_refresh_token: str | None,
+        ) -> None:
+            _persist_gmail_token_state(
+                user_id,
+                refreshed_access_token,
+                expiry,
+                refreshed_refresh_token,
+            )
+            token_state["access_token"] = refreshed_access_token
+            token_state["expiry"] = expiry
+
+        _ensure_gmail_watch(
+            watch_user,
+            active_token,
+            persist_refreshed_token,
+        )
+        active_token = token_state["access_token"]
+        start_history_id = watch_user.last_history_id
+        if not start_history_id:
+            raise RuntimeError("Gmail watch did not save a history cursor.")
+
+        db = SessionLocal()
+        try:
+            stored_user = (
+                db.query(UserAccount).filter(UserAccount.id == user_id).one()
+            )
+            stored_user.last_history_id = watch_user.last_history_id
+            stored_user.watch_expiration = watch_user.watch_expiration
+            stored_user.access_token = active_token
+            stored_user.token_expiry = token_state["expiry"]
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+        listed_ids, active_token = list_message_ids(
+            access_token=active_token,
+            query="in:inbox newer_than:3d",
+            refresh_token=refresh_token,
+            token_expiry=token_state["expiry"],
+            on_token_refresh=persist_refreshed_token,
+        )
+        token_state["access_token"] = active_token
+        changed_ids, latest_history_id, active_token = (
+            fetch_new_message_ids_from_history(
+                access_token=active_token,
+                start_history_id=start_history_id,
+                refresh_token=refresh_token,
+                raise_on_expired=True,
+                token_expiry=token_state["expiry"],
+                on_token_refresh=persist_refreshed_token,
+            )
+        )
+        token_state["access_token"] = active_token
+
+        message_ids = list(dict.fromkeys([*listed_ids, *changed_ids]))
+        fetched_emails = []
+        for message_id in message_ids:
+            email_data = fetch_single_email(
+                access_token=active_token,
+                message_id=message_id,
+                refresh_token=refresh_token,
+                token_expiry=token_state["expiry"],
+                on_token_refresh=persist_refreshed_token,
+            )
+            active_token = email_data.get("access_token", active_token)
+            token_state["access_token"] = active_token
+            fetched_emails.append(email_data)
+
+        db = SessionLocal()
+        try:
+            user = db.query(UserAccount).filter(UserAccount.id == user_id).one()
+            if user.initial_sync_completed_at:
+                user.initial_sync_status = "completed"
+                db.commit()
+                return
+            imported_count = sum(
+                _store_email_if_new(db, user, email_data)
+                for email_data in fetched_emails
+            )
+            user.access_token = active_token
+            user.token_expiry = token_state["expiry"]
+            user.last_history_id = (
+                _latest_history_id(user.last_history_id, latest_history_id)
+                or start_history_id
+            )
+            user.initial_sync_completed_at = datetime.now(timezone.utc)
+            user.initial_sync_status = "completed"
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+        logger.info(
+            "Initial Gmail synchronization completed for user_id=%s imported=%s skipped=%s",
+            user_id,
+            imported_count,
+            len(message_ids) - imported_count,
+        )
+        try:
+            tag_recent_untagged_emails(user_id)
+        except Exception:
+            logger.exception(
+                "Initial Gmail synchronization tagging failed for user_id=%s",
+                user_id,
+            )
+    except Exception:
+        logger.exception("Initial Gmail synchronization failed for user_id=%s", user_id)
+        try:
+            _mark_initial_sync_failed(user_id)
+        except Exception:
+            logger.exception(
+                "Could not record initial Gmail synchronization failure for user_id=%s",
+                user_id,
+            )
+        raise
+
+
+@router.post(
+    "/emails/sync-initial",
+    response_model=InitialSyncResponse,
+    responses={202: {"model": InitialSyncResponse}},
+)
 def sync_initial_emails(
     background_tasks: BackgroundTasks,
+    response: Response,
     authorization: str = Header(...),
     db: Session = Depends(get_db),
 ):
-    """Imports the last three days once, then applies Gmail changes since the watch cursor."""
-    token = _get_bearer_token(authorization)
-    storage_db: Session | None = None
-
+    """Queue an initial Gmail import and return without fetching mailbox messages."""
     try:
-        user, active_token = _resolve_user_account(token, db, create=True)
+        user, _ = _resolve_user_account(
+            _get_bearer_token(authorization),
+            db,
+            create=True,
+        )
         user_id = user.id
-        refresh_token = user.refresh_token
+        db.commit()
+
         if user.initial_sync_completed_at:
             history_id = user.last_history_id or ""
             db.close()
@@ -304,100 +528,104 @@ def sync_initial_emails(
                 history_id=history_id,
             )
 
-        watch_user = UserAccount(
-            id=user_id,
-            refresh_token=refresh_token,
-            last_history_id=user.last_history_id,
-            watch_expiration=user.watch_expiration,
-        )
-        db.close()
-        _ensure_gmail_watch(watch_user, active_token)
-        start_history_id = watch_user.last_history_id
-        if not start_history_id:
-            raise RuntimeError("Gmail watch did not save a history cursor.")
-
-        storage_db = SessionLocal()
-        stored_user = (
-            storage_db.query(UserAccount).filter(UserAccount.id == user_id).one()
-        )
-        stored_user.last_history_id = watch_user.last_history_id
-        stored_user.watch_expiration = watch_user.watch_expiration
-        storage_db.commit()
-        storage_db.close()
-        storage_db = None
-
-        listed_ids, active_token = list_message_ids(
-            access_token=active_token,
-            query="in:inbox newer_than:3d",
-            refresh_token=refresh_token,
-        )
-        changed_ids, latest_history_id, active_token = (
-            fetch_new_message_ids_from_history(
-                access_token=active_token,
-                start_history_id=start_history_id,
-                refresh_token=refresh_token,
-                raise_on_expired=True,
-            )
-        )
-
-        message_ids = list(dict.fromkeys([*listed_ids, *changed_ids]))
-        fetched_emails = []
-        imported_count = 0
-        for message_id in message_ids:
-            email_data = fetch_single_email(
-                access_token=active_token,
-                message_id=message_id,
-                refresh_token=refresh_token,
-            )
-            active_token = email_data.get("access_token", active_token)
-            fetched_emails.append(email_data)
-
-        storage_db = SessionLocal()
-        user = storage_db.query(UserAccount).filter(UserAccount.id == user_id).one()
-        if user.initial_sync_completed_at:
+        current_status = getattr(user, "initial_sync_status", None)
+        if current_status in ("pending", "running"):
             history_id = user.last_history_id or ""
-            storage_db.close()
+            db.close()
+            response.status_code = 202
             return InitialSyncResponse(
-                status="already_completed",
+                status=current_status,
                 imported_count=0,
                 skipped_count=0,
                 history_id=history_id,
             )
-        for email_data in fetched_emails:
-            if _store_email_if_new(storage_db, user, email_data):
-                imported_count += 1
-        user.access_token = active_token
-        user.last_history_id = (
-            _latest_history_id(user.last_history_id, latest_history_id)
-            or start_history_id
+
+        claimed = (
+            db.query(UserAccount)
+            .filter(
+                UserAccount.id == user_id,
+                UserAccount.initial_sync_completed_at.is_(None),
+                or_(
+                    UserAccount.initial_sync_status.is_(None),
+                    UserAccount.initial_sync_status == "failed",
+                ),
+            )
+            .update(
+                {UserAccount.initial_sync_status: "pending"},
+                synchronize_session=False,
+            )
         )
-        user.initial_sync_completed_at = datetime.now(timezone.utc)
-        storage_db.commit()
-        history_id = user.last_history_id
-        storage_db.close()
-        storage_db = None
-        background_tasks.add_task(tag_recent_untagged_emails, user.id)
+        db.commit()
+
+        if not claimed:
+            db.refresh(user)
+            current_status = getattr(user, "initial_sync_status", None)
+            if user.initial_sync_completed_at:
+                history_id = user.last_history_id or ""
+                db.close()
+                return InitialSyncResponse(
+                    status="already_completed",
+                    imported_count=0,
+                    skipped_count=0,
+                    history_id=history_id,
+                )
+            if current_status in ("pending", "running"):
+                history_id = user.last_history_id or ""
+                db.close()
+                response.status_code = 202
+                return InitialSyncResponse(
+                    status=current_status,
+                    imported_count=0,
+                    skipped_count=0,
+                    history_id=history_id,
+                )
+            raise HTTPException(
+                status_code=503,
+                detail="Unable to queue initial Gmail synchronization.",
+            )
+
+        history_id = user.last_history_id or ""
+        db.close()
+        background_tasks.add_task(run_initial_gmail_sync, user_id)
+        response.status_code = 202
         return InitialSyncResponse(
-            status="completed",
-            imported_count=imported_count,
-            skipped_count=len(message_ids) - imported_count,
+            status="pending",
+            imported_count=0,
+            skipped_count=0,
             history_id=history_id,
         )
     except HTTPException:
-        if storage_db is not None:
-            storage_db.rollback()
-            storage_db.close()
         db.rollback()
+        db.close()
         raise
-    except Exception as e:
-        if storage_db is not None:
-            storage_db.rollback()
-            storage_db.close()
+    except Exception as exc:
         db.rollback()
-        logger.exception("Initial Gmail synchronization failed")
+        db.close()
+        logger.exception("Unable to queue initial Gmail synchronization")
         raise HTTPException(
-            status_code=502, detail="Initial Gmail synchronization failed."
-        ) from e
+            status_code=502,
+            detail="Unable to queue initial Gmail synchronization.",
+        ) from exc
+
+
+@router.get(
+    "/emails/sync-initial/status",
+    response_model=InitialSyncStatusResponse,
+)
+def get_initial_sync_status(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    user, _ = _resolve_user_account(_get_bearer_token(authorization), db)
+    db.commit()
+    if user.initial_sync_completed_at:
+        status = "completed"
+    else:
+        status = getattr(user, "initial_sync_status", None) or "not_started"
+    return InitialSyncStatusResponse(
+        status=status,
+        history_id=user.last_history_id,
+    )
 
 
 def process_realtime_email_update(email_address: str, pushed_history_id: str):
@@ -411,33 +639,58 @@ def process_realtime_email_update(email_address: str, pushed_history_id: str):
         )
         if not user_data or not user_data.access_token:
             logger.warning("No credentials found for incoming user %s", email_address)
-            return
+            raise GmailReauthorizationRequired(
+                "Reconnect your Google account to restore Gmail synchronization."
+            )
 
         user_id = user_data.id
         access_token = user_data.access_token
         refresh_token = user_data.refresh_token
+        token_expiry = user_data.token_expiry
         start_id = user_data.last_history_id or pushed_history_id
     finally:
         db.close()
 
-    try:
-        new_ids, latest_id, active_token = fetch_new_message_ids_from_history(
-            access_token=access_token,
-            start_history_id=start_id,
-            refresh_token=refresh_token,
+    token_state = {"expiry": token_expiry}
+
+    def persist_refreshed_token(
+        refreshed_access_token: str,
+        expiry: datetime | None,
+        refreshed_refresh_token: str | None,
+    ) -> None:
+        _persist_gmail_token_state(
+            user_id,
+            refreshed_access_token,
+            expiry,
+            refreshed_refresh_token,
         )
-        fetched_emails = []
-        for msg_id in new_ids:
-            email_data = fetch_single_email(
-                access_token=active_token,
-                message_id=msg_id,
-                refresh_token=refresh_token,
-            )
-            active_token = email_data.get("access_token", active_token)
-            fetched_emails.append(email_data)
-    except Exception:
-        logger.exception("Failed fetching Gmail delta for %s", email_address)
-        return
+        token_state["expiry"] = expiry
+
+    _, active_token, token_expiry = get_gmail_service_with_token_state(
+        access_token,
+        refresh_token,
+        token_expiry,
+        refresh_if_expiry_missing=bool(refresh_token),
+        on_token_refresh=persist_refreshed_token,
+    )
+    new_ids, latest_id, active_token = fetch_new_message_ids_from_history(
+        access_token=active_token,
+        start_history_id=start_id,
+        refresh_token=refresh_token,
+        token_expiry=token_state["expiry"],
+        on_token_refresh=persist_refreshed_token,
+    )
+    fetched_emails = []
+    for msg_id in new_ids:
+        email_data = fetch_single_email(
+            access_token=active_token,
+            message_id=msg_id,
+            refresh_token=refresh_token,
+            token_expiry=token_state["expiry"],
+            on_token_refresh=persist_refreshed_token,
+        )
+        active_token = email_data.get("access_token", active_token)
+        fetched_emails.append(email_data)
 
     db = SessionLocal()
     try:
@@ -449,6 +702,7 @@ def process_realtime_email_update(email_address: str, pushed_history_id: str):
             )
             return
         user.access_token = active_token
+        user.token_expiry = token_state["expiry"]
         user.last_history_id = _latest_history_id(user.last_history_id, latest_id)
         for email_data in fetched_emails:
             _store_email_if_new(db, user, email_data)
@@ -461,8 +715,7 @@ def process_realtime_email_update(email_address: str, pushed_history_id: str):
         )
     except Exception:
         db.rollback()
-        logger.exception("Failed storing Gmail delta for %s", email_address)
-        return
+        raise
     finally:
         db.close()
 
@@ -473,23 +726,39 @@ def process_realtime_email_update(email_address: str, pushed_history_id: str):
 
 
 @router.post("/webhooks/gmail/pubsub")
-async def gmail_pubsub_webhook(
-    req: PubSubPushRequest, background_tasks: BackgroundTasks
-):
-    """Receives Cloud Pub/Sub pushes and delegates ingestion to a background worker."""
+def gmail_pubsub_webhook(req: PubSubPushRequest):
+    """Processes a Cloud Pub/Sub push before acknowledging successful ingestion."""
     try:
-        raw_data = base64.b64decode(req.message.data).decode("utf-8")
+        raw_data = base64.b64decode(req.message.data, validate=True).decode("utf-8")
         payload = json.loads(raw_data)
+        if not isinstance(payload, dict):
+            raise ValueError("Pub/Sub payload must be a JSON object")
 
         email_address = payload.get("emailAddress")
         history_id = payload.get("historyId")
+        if not isinstance(email_address, str) or not email_address.strip():
+            raise ValueError("Pub/Sub payload is missing emailAddress")
+        if history_id is None or isinstance(history_id, bool):
+            raise ValueError("Pub/Sub payload is missing historyId")
+    except (
+        binascii.Error,
+        UnicodeDecodeError,
+        ValueError,
+    ) as exc:
+        logger.warning("Malformed Pub/Sub message received")
+        raise HTTPException(
+            status_code=400,
+            detail="Malformed Gmail notification.",
+        ) from exc
 
-        if email_address and history_id:
-            background_tasks.add_task(
-                process_realtime_email_update, email_address, str(history_id)
-            )
-    except Exception:
-        logger.exception("Malformed Pub/Sub message received")
+    try:
+        process_realtime_email_update(email_address, str(history_id))
+    except Exception as exc:
+        logger.exception("Failed processing Gmail Pub/Sub notification")
+        raise HTTPException(
+            status_code=503,
+            detail="Gmail notification processing failed; retry the delivery.",
+        ) from exc
 
     return Response(status_code=204)
 
@@ -653,6 +922,7 @@ def send_reply(
     sender = email.sender
     subject = email.subject
     refresh_token = user.refresh_token
+    token_expiry = user.token_expiry
     db.close()
     try:
         sent_id = send_email_reply(
@@ -663,6 +933,7 @@ def send_reply(
             subject=subject,
             body=req.body,
             refresh_token=refresh_token,
+            token_expiry=token_expiry,
         )
         return {"status": "sent", "message_id": sent_id}
     # except ValueError as e:

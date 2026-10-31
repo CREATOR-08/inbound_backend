@@ -6,11 +6,13 @@ import re
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import parseaddr, parsedate_to_datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 logger = logging.getLogger(__name__)
 
@@ -19,33 +21,102 @@ GMAIL_PUBSUB_TOPIC = os.getenv(
 )
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GMAIL_TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+
+class GmailReauthorizationRequired(Exception):
+    """Raised when an expired Gmail token cannot be refreshed."""
+
+
+TokenRefreshCallback = Callable[
+    [str, Optional[datetime], Optional[str]], None
+]
+
+
+def get_gmail_service_with_token_state(
+    access_token: str,
+    refresh_token: Optional[str] = None,
+    token_expiry: Optional[datetime] = None,
+    *,
+    refresh_if_expiry_missing: bool = False,
+    on_token_refresh: Optional[TokenRefreshCallback] = None,
+) -> Tuple[Any, str, Optional[datetime]]:
+    """Build a Gmail client and return any refreshed token state."""
+    normalized_refresh_token = refresh_token or None
+    credentials_expiry = token_expiry
+    if credentials_expiry and credentials_expiry.tzinfo:
+        credentials_expiry = credentials_expiry.astimezone(
+            timezone.utc
+        ).replace(tzinfo=None)
+    credentials = Credentials(
+        token=access_token,
+        refresh_token=normalized_refresh_token,
+        token_uri=GMAIL_TOKEN_URI,
+        client_id=GOOGLE_CLIENT_ID or None,
+        client_secret=GOOGLE_CLIENT_SECRET or None,
+        expiry=credentials_expiry,
+    )
+
+    should_refresh = credentials.expired or (
+        refresh_if_expiry_missing and token_expiry is None
+    )
+    if should_refresh:
+        if not normalized_refresh_token:
+            raise GmailReauthorizationRequired(
+                "Reconnect your Google account to restore Gmail synchronization."
+            )
+        if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+            raise RuntimeError("Google OAuth client credentials are not configured.")
+
+        try:
+            credentials.refresh(Request())
+        except RefreshError as exc:
+            logger.warning(
+                "Google OAuth token refresh failed (%s)",
+                type(exc).__name__,
+            )
+            raise GmailReauthorizationRequired(
+                "Reconnect your Google account to restore Gmail synchronization."
+            ) from exc
+        if on_token_refresh:
+            refreshed_expiry = credentials.expiry
+            if refreshed_expiry and refreshed_expiry.tzinfo is None:
+                refreshed_expiry = refreshed_expiry.replace(tzinfo=timezone.utc)
+            elif refreshed_expiry:
+                refreshed_expiry = refreshed_expiry.astimezone(timezone.utc)
+            on_token_refresh(
+                credentials.token,
+                refreshed_expiry,
+                credentials.refresh_token,
+            )
+
+    service = build("gmail", "v1", credentials=credentials)
+    refreshed_expiry = credentials.expiry
+    if refreshed_expiry and refreshed_expiry.tzinfo is None:
+        refreshed_expiry = refreshed_expiry.replace(tzinfo=timezone.utc)
+    elif refreshed_expiry:
+        refreshed_expiry = refreshed_expiry.astimezone(timezone.utc)
+    return service, credentials.token or access_token, refreshed_expiry
 
 
 def get_gmail_service_from_token(
-    access_token: str, refresh_token: Optional[str] = None
+    access_token: str,
+    refresh_token: Optional[str] = None,
+    token_expiry: Optional[datetime] = None,
+    on_token_refresh: Optional[TokenRefreshCallback] = None,
 ) -> Tuple[Any, str]:
     """Builds a Gmail API client dynamically using the OAuth token.
 
     Automatically refreshes expired access tokens if a refresh token is
     available. Returns (service, valid_access_token).
     """
-    creds = Credentials(
-        token=access_token,
-        refresh_token=refresh_token,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
+    service, active_token, _ = get_gmail_service_with_token_state(
+        access_token,
+        refresh_token,
+        token_expiry,
+        on_token_refresh=on_token_refresh,
     )
-
-    if creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-        except Exception:
-            logger.exception("Failed to refresh Google OAuth access token")
-            raise
-
-    service = build("gmail", "v1", credentials=creds)
-    return service, creds.token or access_token
+    return service, active_token
 
 
 def _decode_base64_payload(data: str) -> str:
@@ -128,9 +199,13 @@ def start_gmail_watch(
     access_token: str,
     refresh_token: Optional[str] = None,
     topic_name: str = GMAIL_PUBSUB_TOPIC,
+    token_expiry: Optional[datetime] = None,
+    on_token_refresh: Optional[TokenRefreshCallback] = None,
 ) -> Dict[str, Any]:
     """Registers Gmail to push INBOX updates to the Cloud Pub/Sub topic."""
-    service, _ = get_gmail_service_from_token(access_token, refresh_token)
+    service, _ = get_gmail_service_from_token(
+        access_token, refresh_token, token_expiry, on_token_refresh
+    )
     body = {
         "labelIds": ["INBOX"],
         "topicName": topic_name,
@@ -139,10 +214,15 @@ def start_gmail_watch(
 
 
 def stop_gmail_watch(
-    access_token: str, refresh_token: Optional[str] = None
+    access_token: str,
+    refresh_token: Optional[str] = None,
+    token_expiry: Optional[datetime] = None,
+    on_token_refresh: Optional[TokenRefreshCallback] = None,
 ) -> None:
     """Stops Gmail push notifications for the authenticated mailbox."""
-    service, _ = get_gmail_service_from_token(access_token, refresh_token)
+    service, _ = get_gmail_service_from_token(
+        access_token, refresh_token, token_expiry, on_token_refresh
+    )
     service.users().stop(userId="me").execute()
 
 
@@ -151,13 +231,15 @@ def fetch_new_message_ids_from_history(
     start_history_id: str,
     refresh_token: Optional[str] = None,
     raise_on_expired: bool = False,
+    token_expiry: Optional[datetime] = None,
+    on_token_refresh: Optional[TokenRefreshCallback] = None,
 ) -> Tuple[List[str], str, str]:
     """Queries Gmail History API for all messages added to INBOX since start_history_id.
 
     Returns: (new_message_ids, latest_history_id, active_token)
     """
     service, active_token = get_gmail_service_from_token(
-        access_token, refresh_token
+        access_token, refresh_token, token_expiry, on_token_refresh
     )
     new_ids: set[str] = set()
     latest_history_id = start_history_id
@@ -189,6 +271,12 @@ def fetch_new_message_ids_from_history(
             if not page_token:
                 break
     except Exception as e:
+        if isinstance(e, HttpError):
+            status = getattr(getattr(e, "resp", None), "status", None)
+            if status == 401 and not refresh_token:
+                raise GmailReauthorizationRequired(
+                    "Reconnect your Google account to restore Gmail synchronization."
+                ) from e
         # History IDs expire after ~1-4 weeks; 404 indicates history window lapsed
         if "History id not found" in str(e) or "404" in str(e):
             logger.warning(
@@ -208,26 +296,36 @@ def list_message_ids(
     access_token: str,
     query: str,
     refresh_token: Optional[str] = None,
+    token_expiry: Optional[datetime] = None,
+    on_token_refresh: Optional[TokenRefreshCallback] = None,
 ) -> Tuple[List[str], str]:
     """Lists every Gmail message matching a query, following all result pages."""
     service, active_token = get_gmail_service_from_token(
-        access_token, refresh_token
+        access_token, refresh_token, token_expiry, on_token_refresh
     )
     message_ids: List[str] = []
     page_token = None
 
     while True:
-        response = (
-            service.users()
-            .messages()
-            .list(
-                userId="me",
-                q=query,
-                maxResults=500,
-                pageToken=page_token,
+        try:
+            response = (
+                service.users()
+                .messages()
+                .list(
+                    userId="me",
+                    q=query,
+                    maxResults=500,
+                    pageToken=page_token,
+                )
+                .execute()
             )
-            .execute()
-        )
+        except HttpError as exc:
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if status == 401 and not refresh_token:
+                raise GmailReauthorizationRequired(
+                    "Reconnect your Google account to restore Gmail synchronization."
+                ) from exc
+            raise
         message_ids.extend(
             message["id"]
             for message in response.get("messages", [])
@@ -241,18 +339,30 @@ def list_message_ids(
 
 
 def fetch_single_email(
-    access_token: str, message_id: str, refresh_token: Optional[str] = None
+    access_token: str,
+    message_id: str,
+    refresh_token: Optional[str] = None,
+    token_expiry: Optional[datetime] = None,
+    on_token_refresh: Optional[TokenRefreshCallback] = None,
 ) -> Dict[str, Any]:
     """Fetches full payload, headers, and parsed body content for a single message."""
     service, active_token = get_gmail_service_from_token(
-        access_token, refresh_token
+        access_token, refresh_token, token_expiry, on_token_refresh
     )
-    message = (
-        service.users()
-        .messages()
-        .get(userId="me", id=message_id, format="full")
-        .execute()
-    )
+    try:
+        message = (
+            service.users()
+            .messages()
+            .get(userId="me", id=message_id, format="full")
+            .execute()
+        )
+    except HttpError as exc:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        if status == 401 and not refresh_token:
+            raise GmailReauthorizationRequired(
+                "Reconnect your Google account to restore Gmail synchronization."
+            ) from exc
+        raise
 
     payload = message.get("payload", {})
     headers = {
@@ -300,6 +410,8 @@ def send_email_reply(
     subject: str,
     body: str,
     refresh_token: Optional[str] = None,
+    token_expiry: Optional[datetime] = None,
+    on_token_refresh: Optional[TokenRefreshCallback] = None,
 ) -> str:
     """Send a reply through Gmail and return the created message ID."""
     recipient = parseaddr(sender)[1]
@@ -308,7 +420,9 @@ def send_email_reply(
     if not body.strip():
         raise ValueError("Reply body cannot be empty")
 
-    service, _ = get_gmail_service_from_token(access_token, refresh_token)
+    service, _ = get_gmail_service_from_token(
+        access_token, refresh_token, token_expiry, on_token_refresh
+    )
     original = (
         service.users()
         .messages()
