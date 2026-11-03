@@ -4,6 +4,7 @@ from app.api.routes.calendar import action_router as calendar_action_router
 from app.api.routes.emails import action_router as email_action_router
 from app.api.routes.emails import router as emails_router
 from app.api.routes.assistant import router as assistant_router
+from app.api.routes.google_auth import router as google_auth_router
 
 
 
@@ -14,3 +15,4 @@ api_router.include_router(calendar_action_router, prefix="/actions")
 
 
 api_router.include_router(assistant_router)
+api_router.include_router(google_auth_router)

@@ -21,10 +21,6 @@ def assistant_command(
         result = assistant_graph.invoke(
             {
                 "user_id": current_user.id,
-                "user_account": {
-                    "access_token": current_user.access_token,
-                    "refresh_token": current_user.refresh_token,
-                },
                 "session_id": request.session_id,
                 "message": request.message,
                 "page_context": request.page_context,

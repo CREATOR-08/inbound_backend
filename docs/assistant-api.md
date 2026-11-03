@@ -214,10 +214,32 @@ populate local data.
 ## Frontend behavior
 
 - Start the initial Gmail import with `POST /api/v1/emails/sync-initial`.
-  The endpoint returns `202 Accepted` with status `pending` (or `running` if
-  an import is already queued). Poll
+  A newly inserted account returns `202 Accepted` with status `pending` (or
+  `running` if its initial import is already queued). Poll
   `GET /api/v1/emails/sync-initial/status` for `not_started`, `pending`,
   `running`, `completed`, or `failed`; refresh the inbox after it completes.
+  For an existing account the POST completes an incremental catch-up and returns
+  its existing initial status without scheduling another initial import.
+- Initial import eligibility is recorded on `UserAccount` only when a row is
+  first inserted. Existing rows, including legacy rows with `pending` or
+  `running` initial statuses, are not re-imported with the three-day query. The
+  same endpoint renews a missing or expired watch and processes Gmail history
+  from the saved cursor. Its response additively includes `account_status`,
+  `sync_mode`, `stored_email_count`, and `incremental_sync_status`. Poll the
+  status endpoint for those fields while incremental synchronization is running
+  or after it fails.
+- Initial eligibility is consumed on the first attempt. If that first import
+  fails after account creation, the existing account is not automatically
+  eligible for another three-day import; recovery must not silently bypass
+  this rule. Incremental failures retain the previous history cursor.
+- A `pending` initial import whose account `updated_at` is more than five
+  minutes old may be claimed again by a later sync/status request. Five minutes
+  allows normal request scheduling and worker startup time while recovering a
+  task lost during the enqueue/process-crash window. The stale claim refreshes
+  `updated_at` atomically; the worker then atomically transitions `pending` to
+  `running`. This is best-effort recovery for in-process BackgroundTasks, not a
+  durable queue, and it does not reclaim `running`, `completed`, or `failed`
+  imports.
 - Send the Google bearer token in `Authorization`; do not provide a user ID.
 - For `DATA_QUERY`, render `data.items` as email cards. When
   `data.next_offset` is non-null, request the next page with message `"next
@@ -270,3 +292,18 @@ not asserted to be available or free in every account. Assistant model calls
 use one bounded retry and a 25-second request timeout.
 `GEMINI_REQUEST_TIMEOUT_SECONDS` can override the timeout. Gmail continues to
 use the existing `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` settings.
+
+## Google token persistence
+
+Set the same high-entropy `GOOGLE_TOKEN_SYNC_SECRET` in the Next.js server
+environment and the FastAPI environment. Do not expose it through a
+`NEXT_PUBLIC_` variable. Better Auth sends Google account tokens to
+`PUT /api/v1/auth/google-tokens` server-to-server; the endpoint verifies the
+access token's Google email and preserves an existing refresh token when no
+replacement is provided. If the FastAPI secret is unset, the endpoint returns
+503 rather than accepting an unauthenticated sync. Keep this endpoint on HTTPS
+outside local development.
+
+The existing `user_accounts.access_token`, `refresh_token`, and `token_expiry`
+columns are reused; no schema migration is required. Existing users can select
+**Reconnect Google** in the inbox to repeat the offline-consent flow.

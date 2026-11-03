@@ -28,6 +28,10 @@ class GmailReauthorizationRequired(Exception):
     """Raised when an expired Gmail token cannot be refreshed."""
 
 
+class GmailHistoryCursorExpired(RuntimeError):
+    """Raised when Gmail no longer retains the requested history cursor."""
+
+
 TokenRefreshCallback = Callable[
     [str, Optional[datetime], Optional[str]], None
 ]
@@ -233,6 +237,7 @@ def fetch_new_message_ids_from_history(
     raise_on_expired: bool = False,
     token_expiry: Optional[datetime] = None,
     on_token_refresh: Optional[TokenRefreshCallback] = None,
+    history_types: Optional[List[str]] = None,
 ) -> Tuple[List[str], str, str]:
     """Queries Gmail History API for all messages added to INBOX since start_history_id.
 
@@ -253,7 +258,7 @@ def fetch_new_message_ids_from_history(
                 .list(
                     userId="me",
                     startHistoryId=start_history_id,
-                    historyTypes=["messageAdded"],
+                    historyTypes=history_types or ["messageAdded"],
                     pageToken=page_token,
                 )
                 .execute()
@@ -266,6 +271,11 @@ def fetch_new_message_ids_from_history(
                     msg = added.get("message", {})
                     if "INBOX" in msg.get("labelIds", []):
                         new_ids.add(msg["id"])
+                for change_key in ("labelsAdded", "labelsRemoved"):
+                    for change in record.get(change_key, []):
+                        msg = change.get("message", {})
+                        if msg.get("id"):
+                            new_ids.add(msg["id"])
 
             page_token = resp.get("nextPageToken")
             if not page_token:
@@ -283,7 +293,7 @@ def fetch_new_message_ids_from_history(
                 "History ID %s expired. Returning empty set.", start_history_id
             )
             if raise_on_expired:
-                raise RuntimeError(
+                raise GmailHistoryCursorExpired(
                     f"Gmail history cursor {start_history_id} expired"
                 ) from e
             return [], start_history_id, active_token
@@ -383,6 +393,9 @@ def fetch_single_email(
         except (TypeError, ValueError, OverflowError):
             received_at = datetime.now(timezone.utc)
 
+    labels = message.get("labelIds", [])
+    is_read = "UNREAD" not in labels
+
     return {
         "id": message["id"],
         "thread_id": message.get("threadId", message["id"]),
@@ -394,7 +407,47 @@ def fetch_single_email(
         "has_html": bool(body_html),
         "received_at": received_at,
         "access_token": active_token,
+        "is_read": is_read,
     }
+
+
+# =========================================================================
+# Read/Unread Status Operations
+# =========================================================================
+
+
+def update_gmail_message_read_status(
+    access_token: str,
+    message_id: str,
+    is_read: bool,
+    refresh_token: Optional[str] = None,
+    token_expiry: Optional[datetime] = None,
+    on_token_refresh: Optional[TokenRefreshCallback] = None,
+) -> Dict[str, Any]:
+    """Synchronize the UNREAD label in Gmail for a message."""
+    service, _ = get_gmail_service_from_token(
+        access_token, refresh_token, token_expiry, on_token_refresh
+    )
+    body: Dict[str, Any] = {}
+    if is_read:
+        body["removeLabelIds"] = ["UNREAD"]
+    else:
+        body["addLabelIds"] = ["UNREAD"]
+
+    try:
+        return (
+            service.users()
+            .messages()
+            .modify(userId="me", id=message_id, body=body)
+            .execute()
+        )
+    except HttpError as exc:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        if status == 401 and not refresh_token:
+            raise GmailReauthorizationRequired(
+                "Reconnect your Google account to restore Gmail synchronization."
+            ) from exc
+        raise
 
 
 # =========================================================================

@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.api.dependencies import _persist_account_token_state
 from app.agent.Assistant.config import ModelTask, get_model
 from app.agent.Assistant.state import AssistantState
 from app.api.schemas.assistant import (
@@ -15,9 +16,10 @@ from app.api.schemas.assistant import (
     PlannedUIAction,
     WorkflowStep,
 )
-from app.db.models import Email
+from app.db.database import SessionLocal
+from app.db.models import Email, UserAccount
 from app.services.assistant_queries import get_email_for_user, search_emails
-from app.services.gmail import send_email_reply
+from app.services.gmail import GmailReauthorizationRequired, send_email_reply
 
 logger = logging.getLogger(__name__)
 MAX_MESSAGE_LENGTH = 8_000
@@ -82,6 +84,7 @@ _EMAIL_COLUMN_MEANINGS = {
     "priority": "Stored email priority.",
     "is_archived": "Whether the email is archived.",
     "created_at": "Stored email received/creation timestamp.",
+    "is_read": "Whether the email is marked as read.",
 }
 _EMAIL_SORT_FIELDS = ["received_at", "sender", "subject", "priority"]
 
@@ -741,12 +744,40 @@ Body: {email["body"]}"""
                     }
                 else:
                     body = step.parameters.get("body")
-                    account = state.get("user_account", {})
-                    access_token = account.get("access_token")
                     if not isinstance(body, str) or not body.strip():
                         raise ValueError("send_email_reply requires a non-empty body.")
-                    if not access_token:
-                        raise RuntimeError("Gmail credentials are unavailable.")
+                    account_db = SessionLocal()
+                    try:
+                        account = (
+                            account_db.query(UserAccount)
+                            .filter(UserAccount.id == state["user_id"])
+                            .first()
+                        )
+                        if account is None or not account.access_token:
+                            raise RuntimeError("Gmail credentials are unavailable.")
+                        account_id = account.id
+                        access_token = account.access_token
+                        refresh_token = account.refresh_token
+                        token_expiry = account.token_expiry
+                    finally:
+                        account_db.close()
+                    refreshed_state = {"access_token": access_token}
+
+                    def persist_refreshed_state(
+                        refreshed_access: str,
+                        expiry: datetime | None,
+                        refreshed_refresh: str | None,
+                    ) -> None:
+                        persisted = _persist_account_token_state(
+                            account_id,
+                            refreshed_access,
+                            expiry,
+                            refreshed_refresh,
+                            expected_access_token=refreshed_state["access_token"],
+                        )
+                        if persisted:
+                            refreshed_state["access_token"] = refreshed_access
+
                     sent_id = send_email_reply(
                         access_token=access_token,
                         email_id=email_id,
@@ -754,7 +785,9 @@ Body: {email["body"]}"""
                         sender=email["sender"],
                         subject=email["subject"],
                         body=body,
-                        refresh_token=account.get("refresh_token"),
+                        refresh_token=refresh_token,
+                        token_expiry=token_expiry,
+                        on_token_refresh=persist_refreshed_state,
                     )
                     result = {"email_id": email_id, "message_id": sent_id}
             else:
@@ -762,15 +795,24 @@ Body: {email["body"]}"""
             results.append({"tool": step.tool, "status": "completed", "data": result})
         except Exception as error:
             logger.exception("Assistant workflow step failed: %s", step.tool)
+            reauthorization_required = isinstance(
+                error,
+                GmailReauthorizationRequired,
+            )
+            step_message = (
+                "Google Gmail access must be reauthorized. Reconnect your Google account and grant offline access."
+                if reauthorization_required
+                else (
+                    str(error)[:300]
+                    if isinstance(error, (ValueError, LookupError))
+                    else "The operation could not be completed."
+                )
+            )
             results.append(
                 {
                     "tool": step.tool,
                     "status": "failed",
-                    "message": (
-                        str(error)[:300]
-                        if isinstance(error, (ValueError, LookupError))
-                        else "The operation could not be completed."
-                    ),
+                    "message": step_message,
                 }
             )
             results.extend(
@@ -783,10 +825,18 @@ Body: {email["body"]}"""
             )
             return {
                 "response": _response(
-                    "The workflow stopped because a step failed. Review the per-step results.",
+                    (
+                        "Google Gmail access must be reauthorized. Reconnect your account and try again."
+                        if reauthorization_required
+                        else "The workflow stopped because a step failed. Review the per-step results."
+                    ),
                     intent="WORKFLOW",
                     data={"results": results},
-                    status="error",
+                    status=(
+                        "reauthorization_required"
+                        if reauthorization_required
+                        else "error"
+                    ),
                 )
             }
 

@@ -27,6 +27,29 @@ from app.services.assistant_queries import get_email_for_user, search_emails
 
 
 class AssistantGraphTests(unittest.TestCase):
+    @staticmethod
+    def fake_account_session():
+        class FakeAccount:
+            id = "u1"
+            access_token = "server-access-token"
+            refresh_token = "server-refresh-token"
+            token_expiry = None
+
+        class FakeSession:
+            def query(self, _model):
+                return self
+
+            def filter(self, _criterion):
+                return self
+
+            def first(self):
+                return FakeAccount()
+
+            def close(self):
+                pass
+
+        return FakeSession()
+
     def test_graph_routes_data_query(self):
         query_plan = nodes.DataQueryPlan(
             source="local_email_store",
@@ -445,15 +468,27 @@ class AssistantGraphTests(unittest.TestCase):
                 },
             ) as get_email,
             patch.object(nodes, "send_email_reply", return_value="sent-id") as send_reply,
+            patch.object(
+                nodes,
+                "SessionLocal",
+                return_value=self.fake_account_session(),
+            ),
         ):
             response = nodes.execute_tools({
                 "user_id": "u1",
-                "user_account": {"access_token": "token"},
                 "approved_workflow": [step],
                 "confirm_workflow": True,
             })["response"]
         get_email.assert_called_once_with("u1", "e1")
         send_reply.assert_called_once()
+        self.assertEqual(
+            send_reply.call_args.kwargs["access_token"],
+            "server-access-token",
+        )
+        self.assertEqual(
+            send_reply.call_args.kwargs["refresh_token"],
+            "server-refresh-token",
+        )
         self.assertEqual(response["status"], "confirmed")
         self.assertEqual(
             response["data"]["results"][0]["data"]["message_id"], "sent-id"
@@ -478,10 +513,14 @@ class AssistantGraphTests(unittest.TestCase):
                 },
             ),
             patch.object(nodes, "send_email_reply", side_effect=RuntimeError("Gmail unavailable")),
+            patch.object(
+                nodes,
+                "SessionLocal",
+                return_value=self.fake_account_session(),
+            ),
         ):
             response = nodes.execute_tools({
                 "user_id": "u1",
-                "user_account": {"access_token": "token"},
                 "approved_workflow": [step],
                 "confirm_workflow": True,
             })["response"]
@@ -530,6 +569,9 @@ class AssistantApiTests(unittest.TestCase):
                 self.criterion = criterion
                 return self
 
+            def with_for_update(self):
+                return self
+
             def first(self):
                 return FakeUser()
 
@@ -537,6 +579,15 @@ class AssistantApiTests(unittest.TestCase):
                 events.append("session_closed")
 
             def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+            def expire(self, _user):
+                pass
+
+            def refresh(self, _user):
                 pass
 
         class FakeRequest:
@@ -573,11 +624,14 @@ class AssistantApiTests(unittest.TestCase):
                 "session_closed",
                 "google_profile",
                 "session_created",
+                "session_created",
+                "session_closed",
                 "session_closed",
             ],
         )
         self.assertEqual(user.id, "u1")
-        self.assertEqual(user.access_token, "active")
+        self.assertFalse(hasattr(user, "access_token"))
+        self.assertFalse(hasattr(user, "refresh_token"))
 
     def test_assistant_endpoint_returns_response_contract(self):
         from app.main import app
@@ -585,8 +639,6 @@ class AssistantApiTests(unittest.TestCase):
         app.dependency_overrides[dependencies.get_current_user] = lambda: AuthenticatedUser(
             id="u1",
             email="user@example.com",
-            access_token="token",
-            refresh_token=None,
         )
         try:
             with (
@@ -610,6 +662,10 @@ class AssistantApiTests(unittest.TestCase):
                 )
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["intent"], "QUESTION")
+            invocation_state = invoke.call_args.args[0]
+            self.assertNotIn("access_token", invocation_state)
+            self.assertNotIn("refresh_token", invocation_state)
+            self.assertNotIn("user_account", invocation_state)
         finally:
             app.dependency_overrides.pop(dependencies.get_current_user, None)
 

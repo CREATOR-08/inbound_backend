@@ -21,6 +21,14 @@ class UserAccount(Base):
     watch_expiration = Column(String(64), nullable=True)
     initial_sync_status = Column(String(16), nullable=True)
     initial_sync_completed_at = Column(DateTime(timezone=True), nullable=True)
+    initial_sync_eligible = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+    )
+    incremental_sync_status = Column(String(16), nullable=True)
+    incremental_sync_id = Column(String(36), nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), default=func.now())
@@ -43,6 +51,7 @@ class Email(Base):
     category = Column(String, nullable=True)
     priority = Column(String, nullable=True)
     is_archived = Column(Boolean, default=False)
+    is_read = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     received_at = synonym("created_at")
 

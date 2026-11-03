@@ -17,7 +17,6 @@ class AssistantState(TypedDict, total=False):
     user_id: str
     session_id: str
     message: str
-    user_account: dict[str, str | None]
     confirm_workflow: bool
     approved_workflow: list[dict[str, Any]] | None
     query_context: dict[str, Any] | None

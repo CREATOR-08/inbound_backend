@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import List, Literal, Optional
 from pydantic import BaseModel
 
@@ -32,11 +33,29 @@ class CalendarApprovalRequest(BaseModel):
 
 class EmailActionRequest(BaseModel):
   email_id: str
+  is_read: Optional[bool] = None
+
+
+class EmailReadUpdateRequest(BaseModel):
+  is_read: bool = False
+
+
+class EmailReadStatusResponse(BaseModel):
+  status: str = "success"
+  email_id: str
+  is_read: bool
 
 
 class EmailSendRequest(BaseModel):
   email_id: str
   body: str
+
+
+class GoogleTokenSyncRequest(BaseModel):
+  email: str
+  access_token: str
+  access_token_expires_at: Optional[datetime] = None
+  refresh_token: Optional[str] = None
 
 
 
@@ -59,12 +78,21 @@ class InitialSyncResponse(BaseModel):
         "completed",
         "already_completed",
         "failed",
+        "not_started",
     ]
     imported_count: int
     skipped_count: int
     history_id: str
+    account_status: Literal["new", "existing"] = "existing"
+    sync_mode: Literal["initial", "incremental"] = "incremental"
+    stored_email_count: int = 0
+    incremental_sync_status: Optional[Literal["running", "completed", "failed"]] = None
 
 
 class InitialSyncStatusResponse(BaseModel):
     status: Literal["not_started", "pending", "running", "completed", "failed"]
     history_id: Optional[str] = None
+    account_status: Literal["new", "existing"] = "existing"
+    sync_mode: Literal["initial", "incremental"] = "incremental"
+    stored_email_count: int = 0
+    incremental_sync_status: Optional[Literal["running", "completed", "failed"]] = None
