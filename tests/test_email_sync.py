@@ -4,7 +4,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from threading import Lock
+from threading import Barrier, Lock
 from types import SimpleNamespace
 from unittest.mock import ANY, patch
 
@@ -138,6 +138,86 @@ def _pubsub_request(payload: dict) -> PubSubPushRequest:
 
 
 class InitialEmailSyncEndpointTests(unittest.TestCase):
+    def test_initial_message_fetches_are_bounded_and_deduplicated(self):
+        started_together = Barrier(3)
+        active_lock = Lock()
+        active_count = 0
+        maximum_active = 0
+        fetched_ids = []
+
+        def fetch_message(message_id):
+            nonlocal active_count, maximum_active
+            with active_lock:
+                active_count += 1
+                maximum_active = max(maximum_active, active_count)
+                fetched_ids.append(message_id)
+            try:
+                if len(fetched_ids) <= 3:
+                    started_together.wait(timeout=5)
+                time.sleep(0.01)
+                return {"id": message_id}
+            finally:
+                with active_lock:
+                    active_count -= 1
+
+        result = emails._fetch_initial_gmail_messages(
+            ["message-1", "message-2", "message-3", "message-1", "message-4"],
+            fetch_message,
+            concurrency_limit=3,
+        )
+
+        self.assertEqual(maximum_active, 3)
+        self.assertEqual(len(fetched_ids), 4)
+        self.assertEqual(
+            [message["id"] for message in result],
+            ["message-1", "message-2", "message-3", "message-4"],
+        )
+
+    def test_initial_message_fetch_failure_prevents_history_cursor_advance(self):
+        user = _sync_user(status="pending")
+        user.initial_sync_eligible = True
+        user.last_history_id = None
+        user.watch_expiration = "1"
+        database = FakeDatabase(user)
+
+        def register_watch(watch_user, _access_token, _on_token_refresh):
+            watch_user.last_history_id = "456"
+            watch_user.watch_expiration = "9999999999999"
+            return {"historyId": "456", "expiration": "9999999999999"}
+
+        with (
+            patch.object(emails, "SessionLocal", return_value=database),
+            patch.object(emails, "_ensure_gmail_watch", side_effect=register_watch),
+            patch.object(
+                emails,
+                "list_message_ids",
+                return_value=(["message-1"], "access-token"),
+            ),
+            patch.object(
+                emails,
+                "fetch_new_message_ids_from_history",
+                return_value=([], "789", "access-token"),
+            ),
+            patch.object(
+                emails,
+                "_initial_gmail_fetch_concurrency",
+                return_value=1,
+            ),
+            patch.object(
+                emails,
+                "fetch_single_email",
+                side_effect=RuntimeError("Gmail API unavailable"),
+            ),
+            patch.object(emails, "tag_recent_untagged_emails") as tag_emails,
+            self.assertRaisesRegex(RuntimeError, "Gmail API unavailable"),
+        ):
+            emails.run_initial_gmail_sync(user.id)
+
+        self.assertIsNone(user.last_history_id)
+        self.assertEqual(user.initial_sync_status, "failed")
+        self.assertFalse(user.initial_sync_eligible)
+        tag_emails.assert_not_called()
+
     def setUp(self):
         auth_token_patch = patch.object(
             emails,

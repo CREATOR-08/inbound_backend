@@ -127,6 +127,29 @@ class EmailReadStatusTests(unittest.TestCase):
         self.assertFalse(result_unread["is_read"])
         self.assertTrue(result_read["is_read"])
 
+    def test_fetch_single_email_uses_configured_google_api_retries(self):
+        message = {
+            "id": "message-1",
+            "payload": {"headers": [], "body": {"data": ""}},
+            "snippet": "Snippet",
+        }
+        mock_service = MagicMock()
+        mock_service.users.return_value.messages.return_value.get.return_value.execute.return_value = message
+
+        with patch(
+            "app.services.gmail.get_gmail_service_from_token",
+            return_value=(mock_service, "token"),
+        ):
+            fetch_single_email(
+                "token",
+                "message-1",
+                num_retries=2,
+            )
+
+        mock_service.users.return_value.messages.return_value.get.return_value.execute.assert_called_once_with(
+            num_retries=2
+        )
+
     def test_update_gmail_message_read_status_calls_modify(self):
         mock_service = MagicMock()
         mock_messages = mock_service.users().messages()
@@ -412,4 +435,3 @@ class EmailReadStatusTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

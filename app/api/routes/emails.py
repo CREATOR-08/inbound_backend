@@ -2,10 +2,13 @@ import base64
 import binascii
 import json
 import logging
+import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from time import perf_counter
-from typing import Optional
+from typing import Callable, Optional
 
 from fastapi import (
     APIRouter,
@@ -64,6 +67,73 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 action_router = APIRouter()
 INITIAL_SYNC_RECOVERY_TIMEOUT_SECONDS = 300
+DEFAULT_INITIAL_GMAIL_FETCH_CONCURRENCY = 5
+INITIAL_GMAIL_MESSAGE_FETCH_RETRIES = 2
+
+
+def _initial_gmail_fetch_concurrency() -> int:
+    configured_limit = os.getenv(
+        "INITIAL_GMAIL_FETCH_CONCURRENCY",
+        str(DEFAULT_INITIAL_GMAIL_FETCH_CONCURRENCY),
+    )
+    try:
+        concurrency_limit = int(configured_limit)
+    except ValueError as exc:
+        raise RuntimeError(
+            "INITIAL_GMAIL_FETCH_CONCURRENCY must be a positive integer."
+        ) from exc
+    if concurrency_limit < 1:
+        raise RuntimeError(
+            "INITIAL_GMAIL_FETCH_CONCURRENCY must be a positive integer."
+        )
+    return concurrency_limit
+
+
+def _fetch_initial_gmail_messages(
+    message_ids: list[str],
+    fetch_message: Callable[[str], dict],
+    concurrency_limit: int,
+) -> list[dict]:
+    unique_message_ids = list(dict.fromkeys(message_ids))
+    worker_count = min(concurrency_limit, len(unique_message_ids))
+    started_at = perf_counter()
+    fetched_by_index: dict[int, dict] = {}
+    failure_count = 0
+    first_error: Exception | None = None
+
+    try:
+        if worker_count:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = {
+                    executor.submit(fetch_message, message_id): index
+                    for index, message_id in enumerate(unique_message_ids)
+                }
+                for future in as_completed(futures):
+                    try:
+                        fetched_by_index[futures[future]] = future.result()
+                    except Exception as exc:
+                        failure_count += 1
+                        if first_error is None:
+                            first_error = exc
+                        logger.warning(
+                            "Initial Gmail message fetch failed (error_type=%s)",
+                            type(exc).__name__,
+                        )
+    finally:
+        logger.info(
+            "Initial Gmail message fetching finished message_count=%s "
+            "concurrency_limit=%s active_workers=%s duration_ms=%.1f "
+            "failure_count=%s",
+            len(unique_message_ids),
+            concurrency_limit,
+            worker_count,
+            (perf_counter() - started_at) * 1000,
+            failure_count,
+        )
+
+    if first_error is not None:
+        raise first_error
+    return [fetched_by_index[index] for index in range(len(unique_message_ids))]
 
 
 def _watch_is_active(expiration: str | None) -> bool:
@@ -525,13 +595,6 @@ def run_initial_gmail_sync(user_id: str) -> None:
                 .with_for_update()
                 .one()
             )
-            stored_user.last_history_id = (
-                _latest_history_id(
-                    stored_user.last_history_id,
-                    watch_user.last_history_id,
-                )
-                or watch_user.last_history_id
-            )
             stored_user.watch_expiration = watch_user.watch_expiration
             db.commit()
         except Exception:
@@ -561,18 +624,51 @@ def run_initial_gmail_sync(user_id: str) -> None:
         token_state["access_token"] = active_token
 
         message_ids = list(dict.fromkeys([*listed_ids, *changed_ids]))
-        fetched_emails = []
-        for message_id in message_ids:
-            email_data = fetch_single_email(
-                access_token=active_token,
+        fetch_token_lock = Lock()
+
+        def persist_parallel_refreshed_token(
+            refreshed_access_token: str,
+            expiry: datetime | None,
+            refreshed_refresh_token: str | None,
+        ) -> None:
+            nonlocal refresh_token
+            with fetch_token_lock:
+                persisted = _persist_gmail_token_state(
+                    user_id,
+                    refreshed_access_token,
+                    expiry,
+                    refreshed_refresh_token,
+                    expected_access_token=token_state["access_token"],
+                )
+                if not persisted:
+                    return
+                token_state["access_token"] = refreshed_access_token
+                token_state["expiry"] = expiry
+                if (
+                    refreshed_refresh_token
+                    and refreshed_refresh_token.strip()
+                ):
+                    refresh_token = refreshed_refresh_token
+
+        def fetch_initial_message(message_id: str) -> dict:
+            with fetch_token_lock:
+                message_access_token = token_state["access_token"]
+                message_refresh_token = refresh_token
+                message_token_expiry = token_state["expiry"]
+            return fetch_single_email(
+                access_token=message_access_token,
                 message_id=message_id,
-                refresh_token=refresh_token,
-                token_expiry=token_state["expiry"],
-                on_token_refresh=persist_refreshed_token,
+                refresh_token=message_refresh_token,
+                token_expiry=message_token_expiry,
+                on_token_refresh=persist_parallel_refreshed_token,
+                num_retries=INITIAL_GMAIL_MESSAGE_FETCH_RETRIES,
             )
-            active_token = email_data.get("access_token", active_token)
-            token_state["access_token"] = active_token
-            fetched_emails.append(email_data)
+
+        fetched_emails = _fetch_initial_gmail_messages(
+            message_ids,
+            fetch_initial_message,
+            _initial_gmail_fetch_concurrency(),
+        )
 
         db = SessionLocal()
         try:
@@ -590,8 +686,6 @@ def run_initial_gmail_sync(user_id: str) -> None:
                 _store_email_if_new(db, user, email_data)
                 for email_data in fetched_emails
             )
-            user.access_token = active_token
-            user.token_expiry = token_state["expiry"]
             user.last_history_id = (
                 _latest_history_id(user.last_history_id, latest_history_id)
                 or start_history_id

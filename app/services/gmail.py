@@ -354,17 +354,22 @@ def fetch_single_email(
     refresh_token: Optional[str] = None,
     token_expiry: Optional[datetime] = None,
     on_token_refresh: Optional[TokenRefreshCallback] = None,
+    num_retries: int = 0,
 ) -> Dict[str, Any]:
     """Fetches full payload, headers, and parsed body content for a single message."""
     service, active_token = get_gmail_service_from_token(
         access_token, refresh_token, token_expiry, on_token_refresh
     )
     try:
-        message = (
+        request = (
             service.users()
             .messages()
             .get(userId="me", id=message_id, format="full")
-            .execute()
+        )
+        message = (
+            request.execute(num_retries=num_retries)
+            if num_retries
+            else request.execute()
         )
     except HttpError as exc:
         status = getattr(getattr(exc, "resp", None), "status", None)
