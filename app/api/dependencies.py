@@ -10,6 +10,10 @@ from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.orm import Session
 
+from app.api.google_profile_cache import (
+    google_profile_verification_cache,
+    invalidate_google_profile_verification,
+)
 from app.db.database import SessionLocal
 from app.db.models import UserAccount
 from app.services.gmail import (
@@ -78,6 +82,7 @@ def _persist_account_token_state(
         ):
             return False
 
+        previous_access_token = user.access_token
         changed = user.access_token != access_token
         user.access_token = access_token
         if token_expiry is not None and user.token_expiry != token_expiry:
@@ -88,6 +93,8 @@ def _persist_account_token_state(
             changed = True
         if changed:
             db.commit()
+            invalidate_google_profile_verification(previous_access_token)
+            invalidate_google_profile_verification(access_token)
         return True
     except Exception:
         db.rollback()
@@ -102,57 +109,133 @@ def _resolve_user_account(
     create: bool = False,
     timing_context: str | None = None,
 ) -> tuple[UserAccount, str]:
+    request_started = perf_counter()
+    database_ms = 0.0
+    credential_setup_ms = 0.0
+    google_profile_ms = 0.0
+    google_profile_calls = 0
+    profile_cache_hit = False
     persisted_token_state: dict[str, str | None] = {
         "user_id": None,
         "access_token": None,
         "refresh_token": None,
     }
 
+    def log_timing() -> None:
+        logger.info(
+            "%s_auth_timing database_ms=%.1f google_profile_ms=%.1f "
+            "credential_setup_ms=%.1f google_profile_calls=%s "
+            "profile_cache_hit=%s total_ms=%.1f",
+            timing_context or "gmail_account",
+            database_ms,
+            google_profile_ms,
+            credential_setup_ms,
+            google_profile_calls,
+            profile_cache_hit,
+            (perf_counter() - request_started) * 1000,
+        )
+
     def persist_refreshed_state(
         refreshed_access: str,
         expiry: datetime | None,
         refreshed_refresh: str | None,
     ) -> None:
+        nonlocal database_ms
         user_id = persisted_token_state["user_id"]
         if user_id is None:
             return
-        persisted = _persist_account_token_state(
-            user_id,
-            refreshed_access,
-            expiry,
-            refreshed_refresh,
-            expected_access_token=persisted_token_state["access_token"],
-        )
+        database_started = perf_counter()
+        try:
+            persisted = _persist_account_token_state(
+                user_id,
+                refreshed_access,
+                expiry,
+                refreshed_refresh,
+                expected_access_token=persisted_token_state["access_token"],
+            )
+        finally:
+            database_ms += (perf_counter() - database_started) * 1000
         if persisted:
             persisted_token_state["access_token"] = refreshed_access
         if refreshed_refresh:
             persisted_token_state["refresh_token"] = refreshed_refresh
 
-    try:
-        google_profile_started = perf_counter()
-        user = (
-            db.query(UserAccount)
-            .filter(UserAccount.access_token == access_token)
-            .first()
-        )
-        token_expiry = None
-        if user is not None:
-            persisted_token_state["user_id"] = user.id
-            persisted_token_state["access_token"] = user.access_token
+    database_started = perf_counter()
+    token_user = (
+        db.query(UserAccount)
+        .filter(UserAccount.access_token == access_token)
+        .first()
+    )
+    database_ms += (perf_counter() - database_started) * 1000
+    token_user_state = (
+        {
+            "id": token_user.id,
+            "email": token_user.email,
+            "access_token": token_user.access_token,
+            "refresh_token": token_user.refresh_token,
+            "token_expiry": token_user.token_expiry,
+        }
+        if token_user is not None
+        else None
+    )
+    db.rollback()
 
-            service, active_token, token_expiry = get_gmail_service_with_token_state(
-                access_token,
-                user.refresh_token,
-                user.token_expiry,
-                refresh_if_expiry_missing=bool(user.refresh_token),
-                on_token_refresh=persist_refreshed_state,
-            )
+    try:
+        token_expiry = None
+        if token_user_state is not None:
+            persisted_token_state["user_id"] = token_user_state["id"]
+            persisted_token_state["access_token"] = token_user_state[
+                "access_token"
+            ]
+
+            credential_setup_started = perf_counter()
+            try:
+                service, active_token, token_expiry = (
+                    get_gmail_service_with_token_state(
+                        access_token,
+                        token_user_state["refresh_token"],
+                        token_user_state["token_expiry"],
+                        refresh_if_expiry_missing=bool(
+                            token_user_state["refresh_token"]
+                        ),
+                        on_token_refresh=persist_refreshed_state,
+                    )
+                )
+            finally:
+                credential_setup_ms += (
+                    perf_counter() - credential_setup_started
+                ) * 1000
         else:
-            service, active_token = get_gmail_service_from_token(access_token)
-        profile = service.users().getProfile(userId="me").execute()
-        google_profile_ms = (perf_counter() - google_profile_started) * 1000
+            credential_setup_started = perf_counter()
+            try:
+                service, active_token = get_gmail_service_from_token(access_token)
+            finally:
+                credential_setup_ms += (
+                    perf_counter() - credential_setup_started
+                ) * 1000
+
+        user_email = None
+        if token_user_state is not None and active_token == access_token:
+            user_email = google_profile_verification_cache.get(
+                access_token,
+                token_user_state["email"],
+                token_user_state["token_expiry"],
+            )
+            profile_cache_hit = user_email is not None
+
+        if user_email is None:
+            profile_started = perf_counter()
+            try:
+                google_profile_calls += 1
+                profile = service.users().getProfile(userId="me").execute()
+            finally:
+                google_profile_ms += (perf_counter() - profile_started) * 1000
+            user_email = profile.get("emailAddress")
+            invalidate_google_profile_verification(access_token)
 
     except GmailReauthorizationRequired as error:
+        invalidate_google_profile_verification(access_token)
+        log_timing()
         raise HTTPException(
             status_code=401,
             detail=(
@@ -163,7 +246,13 @@ def _resolve_user_account(
 
     except HttpError as error:
         status = getattr(getattr(error, "resp", None), "status", None)
+        if status in (401, 403):
+            invalidate_google_profile_verification(access_token)
+            invalidate_google_profile_verification(
+                persisted_token_state["access_token"]
+            )
         logger.info("Google rejected Gmail authentication with status %s", status)
+        log_timing()
 
         if status in (401, 403):
             raise HTTPException(
@@ -185,6 +274,8 @@ def _resolve_user_account(
         google.auth.exceptions.RefreshError,
         google.auth.exceptions.GoogleAuthError,
     ) as error:
+        invalidate_google_profile_verification(access_token)
+        log_timing()
         logger.info(
             "Google authentication failed: %s",
             type(error).__name__,
@@ -194,7 +285,6 @@ def _resolve_user_account(
             detail="Invalid or expired Google access token.",
         ) from error
 
-    user_email = profile.get("emailAddress")
     if not user_email:
         raise HTTPException(
             status_code=401,
@@ -207,26 +297,53 @@ def _resolve_user_account(
         .filter(func.lower(UserAccount.email) == user_email.lower())
         .first()
     )
+    database_ms += (perf_counter() - account_lookup_started) * 1000
     if account_by_email is None:
         user = None
-    elif user is None or user.id != account_by_email.id:
-        user = account_by_email
-        previous_access_token = user.access_token
-        persisted_token_state["user_id"] = user.id
+    elif (
+        token_user_state is None
+        or token_user_state["id"] != account_by_email.id
+    ):
+        previous_access_token = account_by_email.access_token
+        previous_refresh_token = account_by_email.refresh_token
+        previous_token_expiry = account_by_email.token_expiry
+        matched_user_id = account_by_email.id
+        persisted_token_state["user_id"] = matched_user_id
         persisted_token_state["access_token"] = previous_access_token
         previous_expiry = (
-            user.token_expiry if previous_access_token == access_token else None
+            previous_token_expiry
+            if previous_access_token == access_token
+            else None
         )
+        db.rollback()
         try:
-            service, active_token, token_expiry = get_gmail_service_with_token_state(
-                active_token,
-                user.refresh_token,
-                previous_expiry,
-                refresh_if_expiry_missing=bool(user.refresh_token),
-                on_token_refresh=persist_refreshed_state,
-            )
-            refreshed_profile = service.users().getProfile(userId="me").execute()
+            credential_setup_started = perf_counter()
+            try:
+                service, active_token, token_expiry = (
+                    get_gmail_service_with_token_state(
+                        active_token,
+                        previous_refresh_token,
+                        previous_expiry,
+                        refresh_if_expiry_missing=bool(previous_refresh_token),
+                        on_token_refresh=persist_refreshed_state,
+                    )
+                )
+            finally:
+                credential_setup_ms += (
+                    perf_counter() - credential_setup_started
+                ) * 1000
+            profile_started = perf_counter()
+            try:
+                google_profile_calls += 1
+                refreshed_profile = (
+                    service.users().getProfile(userId="me").execute()
+                )
+            finally:
+                google_profile_ms += (perf_counter() - profile_started) * 1000
         except GmailReauthorizationRequired as error:
+            invalidate_google_profile_verification(access_token)
+            invalidate_google_profile_verification(active_token)
+            log_timing()
             raise HTTPException(
                 status_code=401,
                 detail=(
@@ -236,6 +353,10 @@ def _resolve_user_account(
             ) from error
         except HttpError as error:
             status = getattr(getattr(error, "resp", None), "status", None)
+            if status in (401, 403):
+                invalidate_google_profile_verification(access_token)
+                invalidate_google_profile_verification(active_token)
+            log_timing()
             if status == 401:
                 raise HTTPException(
                     status_code=401,
@@ -256,18 +377,20 @@ def _resolve_user_account(
                 status_code=401,
                 detail="Google account credentials do not match the authenticated account.",
             )
+        database_started = perf_counter()
+        user = (
+            db.query(UserAccount)
+            .filter(UserAccount.id == matched_user_id)
+            .first()
+        )
+        database_ms += (perf_counter() - database_started) * 1000
+        if user is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Gmail account not found.",
+            )
     else:
         user = account_by_email
-
-    account_lookup_ms = (perf_counter() - account_lookup_started) * 1000
-
-    if timing_context:
-        logger.info(
-            "%s_auth_timing google_profile_ms=%.1f account_lookup_ms=%.1f",
-            timing_context,
-            google_profile_ms,
-            account_lookup_ms,
-        )
 
     created_account = False
     if user is None:
@@ -310,15 +433,31 @@ def _resolve_user_account(
         if persisted_token_state["user_id"] is None:
             persisted_token_state["user_id"] = user.id
             persisted_token_state["access_token"] = user.access_token
-        _persist_account_token_state(
-            user.id,
+        database_started = perf_counter()
+        try:
+            _persist_account_token_state(
+                user.id,
+                active_token,
+                token_expiry,
+                persisted_token_state["refresh_token"],
+                expected_access_token=persisted_token_state["access_token"],
+            )
+            db.expire(user)
+            db.refresh(user)
+        finally:
+            database_ms += (perf_counter() - database_started) * 1000
+
+    if (
+        user.email.casefold() == user_email.casefold()
+        and user.access_token == active_token
+    ):
+        google_profile_verification_cache.set(
             active_token,
-            token_expiry,
-            persisted_token_state["refresh_token"],
-            expected_access_token=persisted_token_state["access_token"],
+            user.email,
+            user.token_expiry,
         )
-        db.expire(user)
-        db.refresh(user)
+
+    log_timing()
 
     return user, active_token
 

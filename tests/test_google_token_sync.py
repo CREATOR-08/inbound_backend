@@ -17,11 +17,22 @@ class FakeDatabase:
         self.statement = None
         self.committed = False
 
+    def query(self, *_models):
+        return FakeQuery()
+
     def execute(self, statement):
         self.statement = statement
 
     def commit(self):
         self.committed = True
+
+
+class FakeQuery:
+    def filter(self, *_conditions):
+        return self
+
+    def first(self):
+        return None
 
 
 class GoogleTokenSyncTests(unittest.TestCase):

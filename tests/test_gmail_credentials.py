@@ -1,16 +1,25 @@
+import re
 import unittest
 from datetime import datetime, timedelta, timezone
+from time import sleep
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
+from googleapiclient.errors import HttpError
 
 from app.api import dependencies
+from app.api.google_profile_cache import (
+    google_profile_verification_cache,
+)
 from app.api.routes import emails
 from app.services import gmail
 
 
 class GmailCredentialTests(unittest.TestCase):
+    def setUp(self):
+        google_profile_verification_cache.clear()
+
     def test_new_account_insert_is_conflict_safe_and_marks_initial_eligibility(self):
         created_user = SimpleNamespace(
             id="user@example.com",
@@ -52,6 +61,9 @@ class GmailCredentialTests(unittest.TestCase):
                 return SimpleNamespace(
                     scalar_one_or_none=lambda: "user@example.com"
                 )
+
+            def rollback(self):
+                pass
 
         service = MagicMock()
         service.users.return_value.getProfile.return_value.execute.return_value = {
@@ -578,6 +590,9 @@ class GmailCredentialTests(unittest.TestCase):
             def query(self, *_args):
                 return FakeQuery()
 
+            def rollback(self):
+                pass
+
             def expire(self, _user):
                 pass
 
@@ -630,6 +645,217 @@ class GmailCredentialTests(unittest.TestCase):
         self.assertEqual(service_factory.call_args.args[1], "user-1-refresh")
         persist_state.assert_called_once()
         self.assertGreaterEqual(queries, 2)
+
+    def test_user_resolution_reuses_cached_profile_for_matching_account(self):
+        user = SimpleNamespace(
+            id="user-1",
+            email="user@example.com",
+            access_token="access-token",
+            refresh_token=None,
+            token_expiry=datetime.now(timezone.utc) + timedelta(minutes=10),
+        )
+
+        class FakeQuery:
+            def filter(self, *_args):
+                return self
+
+            def first(self):
+                return user
+
+        class FakeDatabase:
+            def query(self, *_args):
+                return FakeQuery()
+
+            def rollback(self):
+                pass
+
+            def expire(self, _user):
+                pass
+
+            def refresh(self, _user):
+                pass
+
+        service = MagicMock()
+
+        def delayed_profile():
+            sleep(0.03)
+            return {"emailAddress": "user@example.com"}
+
+        service.users.return_value.getProfile.return_value.execute.side_effect = (
+            delayed_profile
+        )
+
+        with (
+            patch.object(
+                dependencies,
+                "get_gmail_service_with_token_state",
+                return_value=(service, "access-token", user.token_expiry),
+            ),
+            patch.object(
+                dependencies,
+                "_persist_account_token_state",
+                return_value=True,
+            ),
+            self.assertLogs(dependencies.logger, level="INFO") as captured,
+        ):
+            for _ in range(2):
+                resolved_user, active_token = dependencies._resolve_user_account(
+                    "access-token",
+                    FakeDatabase(),
+                    timing_context="test",
+                )
+                self.assertIs(resolved_user, user)
+                self.assertEqual(active_token, "access-token")
+
+        profile_request = service.users.return_value.getProfile.return_value
+        profile_request.execute.assert_called_once_with()
+        logs = "\n".join(captured.output)
+        self.assertIn("google_profile_calls=1", logs)
+        self.assertIn("google_profile_calls=0", logs)
+        self.assertIn("profile_cache_hit=True", logs)
+        profile_durations = [
+            float(value)
+            for value in re.findall(r"google_profile_ms=([0-9.]+)", logs)
+        ]
+        self.assertEqual(len(profile_durations), 2)
+        self.assertGreaterEqual(profile_durations[0], 20)
+        self.assertLess(profile_durations[1], 20)
+
+    def test_invalid_google_profile_response_is_not_cached(self):
+        class FakeQuery:
+            def filter(self, *_args):
+                return self
+
+            def first(self):
+                return None
+
+        class FakeDatabase:
+            def query(self, *_args):
+                return FakeQuery()
+
+            def rollback(self):
+                pass
+
+        service = MagicMock()
+        service.users.return_value.getProfile.return_value.execute.side_effect = (
+            HttpError(
+                SimpleNamespace(status=401, reason="Unauthorized"),
+                b"unauthorized",
+            )
+        )
+
+        with (
+            patch.object(
+                dependencies,
+                "get_gmail_service_from_token",
+                return_value=(service, "invalid-token"),
+            ),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            dependencies._resolve_user_account(
+                "invalid-token",
+                FakeDatabase(),
+            )
+
+        self.assertEqual(raised.exception.status_code, 401)
+        self.assertIsNone(
+            google_profile_verification_cache.get(
+                "invalid-token",
+                "user@example.com",
+            )
+        )
+        service.users.return_value.getProfile.return_value.execute.assert_called_once()
+
+    def test_google_403_invalidates_cached_profile_identity(self):
+        service = MagicMock()
+        service.users.return_value.messages.return_value.list.return_value.execute.side_effect = (
+            HttpError(
+                SimpleNamespace(status=403, reason="Forbidden"),
+                b"forbidden",
+            )
+        )
+        google_profile_verification_cache.set(
+            "access-token",
+            "user@example.com",
+        )
+
+        with (
+            patch.object(
+                gmail,
+                "get_gmail_service_from_token",
+                return_value=(service, "access-token"),
+            ),
+            self.assertRaises(HttpError),
+        ):
+            gmail.list_message_ids("access-token", "in:inbox")
+
+        self.assertIsNone(
+            google_profile_verification_cache.get(
+                "access-token",
+                "user@example.com",
+            )
+        )
+
+    def test_token_replacement_invalidates_old_and_new_profile_entries(self):
+        user = SimpleNamespace(
+            id="user-1",
+            access_token="old-access-token",
+            refresh_token="refresh-token",
+            token_expiry=None,
+        )
+
+        class FakeQuery:
+            def filter(self, *_args):
+                return self
+
+            def with_for_update(self):
+                return self
+
+            def first(self):
+                return user
+
+        class FakeDatabase:
+            def query(self, *_args):
+                return FakeQuery()
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+            def close(self):
+                pass
+
+        google_profile_verification_cache.set(
+            "old-access-token", "user@example.com"
+        )
+        google_profile_verification_cache.set(
+            "new-access-token", "user@example.com"
+        )
+        with patch.object(
+            dependencies,
+            "SessionLocal",
+            return_value=FakeDatabase(),
+        ):
+            dependencies._persist_account_token_state(
+                "user-1",
+                "new-access-token",
+                datetime.now(timezone.utc) + timedelta(minutes=10),
+            )
+
+        self.assertIsNone(
+            google_profile_verification_cache.get(
+                "old-access-token",
+                "user@example.com",
+            )
+        )
+        self.assertIsNone(
+            google_profile_verification_cache.get(
+                "new-access-token",
+                "user@example.com",
+            )
+        )
 
 
 if __name__ == "__main__":

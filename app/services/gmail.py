@@ -14,6 +14,8 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from app.api.google_profile_cache import invalidate_google_profile_verification
+
 logger = logging.getLogger(__name__)
 
 GMAIL_PUBSUB_TOPIC = os.getenv(
@@ -30,6 +32,16 @@ class GmailReauthorizationRequired(Exception):
 
 class GmailHistoryCursorExpired(RuntimeError):
     """Raised when Gmail no longer retains the requested history cursor."""
+
+
+def _invalidate_profile_cache_after_google_error(
+    error: HttpError,
+    *access_tokens: str,
+) -> None:
+    status = getattr(getattr(error, "resp", None), "status", None)
+    if status in (401, 403):
+        for access_token in access_tokens:
+            invalidate_google_profile_verification(access_token)
 
 
 TokenRefreshCallback = Callable[
@@ -207,14 +219,20 @@ def start_gmail_watch(
     on_token_refresh: Optional[TokenRefreshCallback] = None,
 ) -> Dict[str, Any]:
     """Registers Gmail to push INBOX updates to the Cloud Pub/Sub topic."""
-    service, _ = get_gmail_service_from_token(
+    service, active_token = get_gmail_service_from_token(
         access_token, refresh_token, token_expiry, on_token_refresh
     )
     body = {
         "labelIds": ["INBOX"],
         "topicName": topic_name,
     }
-    return service.users().watch(userId="me", body=body).execute()
+    try:
+        return service.users().watch(userId="me", body=body).execute()
+    except HttpError as exc:
+        _invalidate_profile_cache_after_google_error(
+            exc, access_token, active_token
+        )
+        raise
 
 
 def stop_gmail_watch(
@@ -224,10 +242,16 @@ def stop_gmail_watch(
     on_token_refresh: Optional[TokenRefreshCallback] = None,
 ) -> None:
     """Stops Gmail push notifications for the authenticated mailbox."""
-    service, _ = get_gmail_service_from_token(
+    service, active_token = get_gmail_service_from_token(
         access_token, refresh_token, token_expiry, on_token_refresh
     )
-    service.users().stop(userId="me").execute()
+    try:
+        service.users().stop(userId="me").execute()
+    except HttpError as exc:
+        _invalidate_profile_cache_after_google_error(
+            exc, access_token, active_token
+        )
+        raise
 
 
 def fetch_new_message_ids_from_history(
@@ -282,6 +306,9 @@ def fetch_new_message_ids_from_history(
                 break
     except Exception as e:
         if isinstance(e, HttpError):
+            _invalidate_profile_cache_after_google_error(
+                e, access_token, active_token
+            )
             status = getattr(getattr(e, "resp", None), "status", None)
             if status == 401 and not refresh_token:
                 raise GmailReauthorizationRequired(
@@ -330,6 +357,9 @@ def list_message_ids(
                 .execute()
             )
         except HttpError as exc:
+            _invalidate_profile_cache_after_google_error(
+                exc, access_token, active_token
+            )
             status = getattr(getattr(exc, "resp", None), "status", None)
             if status == 401 and not refresh_token:
                 raise GmailReauthorizationRequired(
@@ -372,6 +402,9 @@ def fetch_single_email(
             else request.execute()
         )
     except HttpError as exc:
+        _invalidate_profile_cache_after_google_error(
+            exc, access_token, active_token
+        )
         status = getattr(getattr(exc, "resp", None), "status", None)
         if status == 401 and not refresh_token:
             raise GmailReauthorizationRequired(
@@ -430,7 +463,7 @@ def update_gmail_message_read_status(
     on_token_refresh: Optional[TokenRefreshCallback] = None,
 ) -> Dict[str, Any]:
     """Synchronize the UNREAD label in Gmail for a message."""
-    service, _ = get_gmail_service_from_token(
+    service, active_token = get_gmail_service_from_token(
         access_token, refresh_token, token_expiry, on_token_refresh
     )
     body: Dict[str, Any] = {}
@@ -447,6 +480,9 @@ def update_gmail_message_read_status(
             .execute()
         )
     except HttpError as exc:
+        _invalidate_profile_cache_after_google_error(
+            exc, access_token, active_token
+        )
         status = getattr(getattr(exc, "resp", None), "status", None)
         if status == 401 and not refresh_token:
             raise GmailReauthorizationRequired(
@@ -478,20 +514,26 @@ def send_email_reply(
     if not body.strip():
         raise ValueError("Reply body cannot be empty")
 
-    service, _ = get_gmail_service_from_token(
+    service, active_token = get_gmail_service_from_token(
         access_token, refresh_token, token_expiry, on_token_refresh
     )
-    original = (
-        service.users()
-        .messages()
-        .get(
-            userId="me",
-            id=email_id,
-            format="metadata",
-            metadataHeaders=["Message-ID", "References"],
+    try:
+        original = (
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=email_id,
+                format="metadata",
+                metadataHeaders=["Message-ID", "References"],
+            )
+            .execute()
         )
-        .execute()
-    )
+    except HttpError as exc:
+        _invalidate_profile_cache_after_google_error(
+            exc, access_token, active_token
+        )
+        raise
     headers = {
         h["name"].lower(): h["value"]
         for h in original.get("payload", {}).get("headers", [])
@@ -510,10 +552,16 @@ def send_email_reply(
     message.set_content(body)
 
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
-    sent = (
-        service.users()
-        .messages()
-        .send(userId="me", body={"raw": raw, "threadId": thread_id})
-        .execute()
-    )
+    try:
+        sent = (
+            service.users()
+            .messages()
+            .send(userId="me", body={"raw": raw, "threadId": thread_id})
+            .execute()
+        )
+    except HttpError as exc:
+        _invalidate_profile_cache_after_google_error(
+            exc, access_token, active_token
+        )
+        raise
     return sent["id"]
