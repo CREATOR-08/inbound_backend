@@ -712,10 +712,15 @@ class GmailCredentialTests(unittest.TestCase):
         logs = "\n".join(captured.output)
         self.assertIn("google_profile_calls=1", logs)
         self.assertIn("google_profile_calls=0", logs)
-        self.assertIn("profile_cache_hit=True", logs)
+        self.assertIn("database_lookup_duration_ms=", logs)
+        self.assertIn("total_resolver_duration_ms=", logs)
+        self.assertIn("profile_cache=miss", logs)
+        self.assertIn("profile_cache=hit", logs)
         profile_durations = [
             float(value)
-            for value in re.findall(r"google_profile_ms=([0-9.]+)", logs)
+            for value in re.findall(
+                r"google_profile_verification_duration_ms=([0-9.]+)", logs
+            )
         ]
         self.assertEqual(len(profile_durations), 2)
         self.assertGreaterEqual(profile_durations[0], 20)

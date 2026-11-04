@@ -123,15 +123,17 @@ def _resolve_user_account(
 
     def log_timing() -> None:
         logger.info(
-            "%s_auth_timing database_ms=%.1f google_profile_ms=%.1f "
-            "credential_setup_ms=%.1f google_profile_calls=%s "
-            "profile_cache_hit=%s total_ms=%.1f",
+            "email_auth_timing endpoint=%s "
+            "database_lookup_duration_ms=%.1f "
+            "google_profile_verification_duration_ms=%.1f "
+            "credential_setup_duration_ms=%.1f google_profile_calls=%s "
+            "profile_cache=%s total_resolver_duration_ms=%.1f",
             timing_context or "gmail_account",
             database_ms,
             google_profile_ms,
             credential_setup_ms,
             google_profile_calls,
-            profile_cache_hit,
+            "hit" if profile_cache_hit else "miss",
             (perf_counter() - request_started) * 1000,
         )
 

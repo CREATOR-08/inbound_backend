@@ -742,6 +742,7 @@ def sync_initial_emails(
             _get_bearer_token(authorization),
             db,
             create=True,
+            timing_context="sync_initial_emails",
         )
         user_id = user.id
         db.commit()
@@ -930,7 +931,11 @@ def get_initial_sync_status(
     authorization: str = Header(...),
     db: Session = Depends(get_db),
 ):
-    user, _ = _resolve_user_account(_get_bearer_token(authorization), db)
+    user, _ = _resolve_user_account(
+        _get_bearer_token(authorization),
+        db,
+        timing_context="get_initial_sync_status",
+    )
     db.commit()
     initial_sync_status = getattr(user, "initial_sync_status", None)
     if (
@@ -1362,7 +1367,11 @@ def get_emails(
     authorization: str = Header(...),
     db: Session = Depends(get_db),
 ):
-    user, _ = _resolve_user_account(_get_bearer_token(authorization), db)
+    user, _ = _resolve_user_account(
+        _get_bearer_token(authorization),
+        db,
+        timing_context="get_emails",
+    )
     db.commit()
 
     filter_read: Optional[bool] = None
