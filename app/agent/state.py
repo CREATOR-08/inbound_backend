@@ -14,13 +14,31 @@ class TriageOutput(BaseModel):
 
 class CalendarEventDraft(BaseModel):
     title: str = Field(description="Summary title of the meeting.")
-    start_time: str = Field(description="ISO 8601 datetime string, or empty if the date/time is ambiguous.")
-    end_time: str = Field(description="ISO 8601 datetime string, or empty if the date/time is ambiguous.")
+    date_expression: str = Field(
+        default="",
+        description="The exact date phrase from the email, without a time, or empty if missing.",
+    )
+    start_time: str = Field(
+        default="",
+        description="The exact start clock-time phrase from the email, without a date.",
+    )
+    end_time: str = Field(
+        default="",
+        description="The exact end clock-time phrase from the email, without a date, or empty if not stated.",
+    )
+    duration: str = Field(
+        default="",
+        description="The exact duration phrase from the email, or empty if not stated.",
+    )
+    timezone: str = Field(
+        default="",
+        description="The exact explicit timezone phrase from the email, or empty if none is stated.",
+    )
     attendees: List[str] = Field(default_factory=list, description="Email addresses of attendees.")
     confidence: float = Field(
         ge=0.0,
         le=1.0,
-        description="Use 0.0 when the email does not support complete, unambiguous event times.",
+        description="Confidence that these extracted phrases accurately reflect the email.",
     )
 
 class ReplyDraftOutput(BaseModel):

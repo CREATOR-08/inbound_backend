@@ -1,4 +1,5 @@
 import base64
+import binascii
 import html
 import logging
 import os
@@ -6,6 +7,7 @@ import re
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import parseaddr, parsedate_to_datetime
+from html.parser import HTMLParser
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from google.auth.exceptions import RefreshError
@@ -141,11 +143,53 @@ def _decode_base64_payload(data: str) -> str:
         return ""
     try:
         padded_data = data + "=" * (-len(data) % 4)
-        return base64.urlsafe_b64decode(padded_data.encode("ASCII")).decode(
+        decoded = base64.b64decode(
+            padded_data.encode("ASCII"),
+            altchars=b"-_",
+            validate=True,
+        )
+        return decoded.decode(
             "utf-8", errors="replace"
         )
-    except Exception:
-        return ""
+    except (UnicodeEncodeError, binascii.Error, ValueError) as error:
+        raise ValueError("Gmail returned a malformed encoded message body.") from error
+
+
+class _EmailHTMLTextParser(HTMLParser):
+    _BLOCK_TAGS = {
+        "address", "article", "blockquote", "br", "dd", "div", "dl", "dt",
+        "footer", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "li", "ol",
+        "p", "pre", "section", "table", "td", "th", "tr", "ul",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"script", "style", "head"}:
+            self._ignored_depth += 1
+        elif not self._ignored_depth and tag in self._BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "head"} and self._ignored_depth:
+            self._ignored_depth -= 1
+        elif not self._ignored_depth and tag in self._BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored_depth:
+            self.parts.append(data)
+
+
+def html_to_text(value: str) -> str:
+    parser = _EmailHTMLTextParser()
+    parser.feed(value)
+    parser.close()
+    lines = (part.strip() for part in "".join(parser.parts).splitlines())
+    return "\n".join(line for line in lines if line)
 
 
 def clean_text_for_llm(raw_text: str) -> str:
@@ -165,6 +209,42 @@ def clean_text_for_llm(raw_text: str) -> str:
         if delimiter in text:
             text = text.split(delimiter)[0]
 
+    lines = text.splitlines()
+    quote_markers = (
+        re.compile(r"^\s*On .+ wrote:\s*$", re.IGNORECASE),
+        re.compile(r"^\s*-{2,}\s*Original Message\s*-{2,}\s*$", re.IGNORECASE),
+        re.compile(r"^\s*From:\s+\S+", re.IGNORECASE),
+        re.compile(r"^\s*--\s*$"),
+    )
+    meeting_cue_before_quote = re.compile(
+        r"\b(meet|meeting|appointment|schedule)\b",
+        re.IGNORECASE,
+    )
+    date_cue_before_quote = re.compile(
+        r"\b(today|tomorrow|yesterday|day after tomorrow|day before yesterday|"
+        r"next week|next monday|next tuesday|next wednesday|next thursday|"
+        r"next friday|next saturday|next sunday|this monday|this tuesday|"
+        r"this wednesday|this thursday|this friday|this saturday|this sunday|"
+        r"january|february|march|april|may|june|july|august|september|"
+        r"october|november|december|monday|tuesday|wednesday|thursday|"
+        r"friday|saturday|sunday)\b",
+        re.IGNORECASE,
+    )
+    clock_cue_before_quote = re.compile(
+        r"\b(?:at\s*)?\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?\b",
+        re.IGNORECASE,
+    )
+    for index, line in enumerate(lines):
+        if any(marker.match(line) for marker in quote_markers):
+            preceding = "\n".join(lines[:index])
+            if (
+                meeting_cue_before_quote.search(preceding)
+                and date_cue_before_quote.search(preceding)
+                and clock_cue_before_quote.search(preceding)
+            ):
+                lines = lines[:index]
+                break
+    text = "\n".join(lines)
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"\n\s*\n+", "\n\n", text)
     return text.strip()
@@ -174,34 +254,47 @@ def _extract_bodies_from_payload(payload: Dict[str, Any]) -> Tuple[str, str]:
     """Recursively traverses the MIME structure to extract both plain text and HTML bodies."""
     plain_parts: List[str] = []
     html_parts: List[str] = []
+    decode_errors: list[ValueError] = []
 
-    def walk_parts(part: Dict[str, Any]):
+    def walk_parts(part: Dict[str, Any]) -> None:
+        if part.get("filename"):
+            return
         mime_type = part.get("mimeType", "")
         body_data = part.get("body", {}).get("data", "")
 
         if body_data:
-            decoded = _decode_base64_payload(body_data)
-            if mime_type == "text/plain":
-                plain_parts.append(decoded)
-            elif mime_type == "text/html":
-                html_parts.append(decoded)
+            try:
+                decoded = _decode_base64_payload(body_data)
+            except ValueError as error:
+                decode_errors.append(error)
+            else:
+                if mime_type == "text/plain":
+                    plain_parts.append(decoded)
+                elif mime_type == "text/html":
+                    html_parts.append(decoded)
 
         for sub_part in part.get("parts", []):
             walk_parts(sub_part)
 
     walk_parts(payload)
-
     body_plain = "\n".join(plain_parts).strip()
     body_html = "\n".join(html_parts).strip()
+    if not body_plain and not body_html and decode_errors:
+        raise ValueError("Gmail message body could not be decoded.") from decode_errors[0]
+    if decode_errors:
+        logger.warning(
+            "Skipped %s malformed MIME body part(s)",
+            len(decode_errors),
+        )
+    body_html = "\n".join(html_parts).strip()
 
+    if not body_plain and body_html:
+        body_plain = html_to_text(body_html)
     if not body_html and body_plain:
         body_html = (
             "<pre style='white-space: pre-wrap; font-family: inherit;'>"
             f"{html.escape(body_plain)}</pre>"
         )
-    if not body_plain and body_html:
-        clean_tags = re.sub(r"<[^>]+>", " ", body_html)
-        body_plain = re.sub(r"\s+", " ", clean_tags).strip()
 
     return body_plain, body_html
 
@@ -417,8 +510,15 @@ def fetch_single_email(
         h["name"].lower(): h["value"] for h in payload.get("headers", [])
     }
 
-    body_plain, body_html = _extract_bodies_from_payload(payload)
-    body_plain = body_plain or message.get("snippet", "")
+    try:
+        body_plain, body_html = _extract_bodies_from_payload(payload)
+    except ValueError:
+        logger.warning(
+            "Unable to decode message body for Gmail message %s",
+            message_id,
+            exc_info=True,
+        )
+        body_plain, body_html = "", ""
 
     received_at = None
     if message.get("internalDate"):

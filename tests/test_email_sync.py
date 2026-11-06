@@ -463,7 +463,7 @@ class InitialEmailSyncEndpointTests(unittest.TestCase):
                 return_value=([], "456", "access-token"),
             ),
             patch.object(emails, "fetch_single_email", return_value=message),
-            patch.object(emails, "_store_email_if_new", return_value=True),
+            patch.object(emails, "_store_initial_emails", return_value=1),
             patch.object(emails, "tag_recent_untagged_emails") as tag_emails,
         ):
             started = time.perf_counter()
@@ -512,7 +512,7 @@ class InitialEmailSyncEndpointTests(unittest.TestCase):
             emails,
             "_resolve_user_account",
             return_value=(user, "access-token"),
-        ):
+        ) as resolver:
             result = emails.get_initial_sync_status(
                 BackgroundTasks(),
                 "******",
@@ -521,6 +521,10 @@ class InitialEmailSyncEndpointTests(unittest.TestCase):
 
         self.assertEqual(result.status, "running")
         self.assertEqual(result.history_id, "123")
+        self.assertTrue(
+            resolver.call_args.kwargs["skip_cached_token_persistence"]
+        )
+        self.assertEqual(request_db.commits, 0)
 
     def test_sync_status_poll_recovers_stale_pending_initial_sync(self):
         user = _sync_user(status="pending")
@@ -547,6 +551,7 @@ class InitialEmailSyncEndpointTests(unittest.TestCase):
         self.assertEqual(len(background_tasks.tasks), 1)
         self.assertIs(background_tasks.tasks[0].func, worker)
         self.assertEqual(background_tasks.tasks[0].args, ("user-1",))
+        self.assertEqual(request_db.commits, 1)
 
     def test_existing_account_uses_incremental_sync_not_initial_import(self):
         user = _sync_user(status="pending")

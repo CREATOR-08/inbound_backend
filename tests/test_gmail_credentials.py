@@ -726,6 +726,56 @@ class GmailCredentialTests(unittest.TestCase):
         self.assertGreaterEqual(profile_durations[0], 20)
         self.assertLess(profile_durations[1], 20)
 
+    def test_status_resolution_skips_redundant_cached_token_persistence(self):
+        user = SimpleNamespace(
+            id="user-1",
+            email="user@example.com",
+            access_token="access-token",
+            refresh_token=None,
+            token_expiry=datetime.now(timezone.utc) + timedelta(minutes=10),
+        )
+
+        class FakeQuery:
+            def filter(self, *_conditions):
+                return self
+
+            def first(self):
+                return user
+
+        class FakeDatabase:
+            def query(self, *_models):
+                return FakeQuery()
+
+            def rollback(self):
+                pass
+
+        google_profile_verification_cache.set(
+            "access-token",
+            user.email,
+            user.token_expiry,
+        )
+        with (
+            patch.object(
+                dependencies,
+                "get_gmail_service_with_token_state",
+                return_value=(MagicMock(), "access-token", user.token_expiry),
+            ),
+            patch.object(
+                dependencies,
+                "_persist_account_token_state",
+            ) as persist_state,
+        ):
+            resolved_user, active_token = dependencies._resolve_user_account(
+                "access-token",
+                FakeDatabase(),
+                timing_context="get_initial_sync_status",
+                skip_cached_token_persistence=True,
+            )
+
+        self.assertIs(resolved_user, user)
+        self.assertEqual(active_token, "access-token")
+        persist_state.assert_not_called()
+
     def test_invalid_google_profile_response_is_not_cached(self):
         class FakeQuery:
             def filter(self, *_args):

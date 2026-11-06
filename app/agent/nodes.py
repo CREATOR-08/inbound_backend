@@ -10,7 +10,12 @@ from app.agent.state import (
     ReplyDraftOutput,
 )
 from app.services.gmail import clean_text_for_llm
+from app.services.calendar_extraction import (
+    email_received_at_in_ist,
+    resolve_calendar_event_draft,
+)
 from app.agent.prompt import SYSTEM_PROMPT
+from langsmith import traceable
 load_dotenv()
 api_key = os.getenv("GOOGLE_API_KEY")
 if not api_key:
@@ -29,7 +34,7 @@ llm2=ChatGoogleGenerativeAI(
         temperature=0.1,
 
 )
-
+@traceable(name='triage_node',run_type='chain')
 # Node 1: Triage & Classify
 def triage_node(state: EmailAgentState) -> dict:
     from langchain_core.prompts import ChatPromptTemplate
@@ -98,7 +103,7 @@ def triage_node(state: EmailAgentState) -> dict:
 #         "suggested_reply": result.suggested_reply,
 #     }
 
-
+@traceable(name='draft_reply',run_type='chain')
 def stream_draft_reply(state: EmailAgentState) -> Iterator[str]:
     prompt = ChatPromptTemplate.from_messages([
         (
@@ -124,25 +129,30 @@ def stream_draft_reply(state: EmailAgentState) -> Iterator[str]:
                     yield block["text"]
 
 
-# Node 3: Calendar Extractor
+@traceable(name='scheduler',run_type='chain')
 def scheduler_node(
     state: EmailAgentState, email_received_at: Optional[str] = None
 ) -> dict:
+    email_body = clean_text_for_llm(state["body"])
+    if not email_body:
+        raise ValueError("The email has no readable body to extract a meeting from.")
+
+    received_at_ist = email_received_at_in_ist(email_received_at)
     prompt = ChatPromptTemplate.from_messages([
         (
             "system",
-            "Extract only meeting details supported by the email. Use Asia/Kolkata "
-            "when the email gives a time without a timezone; honor any explicitly "
-            "stated timezone. Resolve relative dates using the email received-at "
-            "timestamp provided below, not an assumed current date or year. "
-            "If the date, start time, end time, or duration is missing or ambiguous, "
-            "set confidence to 0.0 and return empty strings for both timestamps. "
-            "Do not invent a date, midnight time, end time, or default duration. "
-            "Otherwise return ISO 8601 timestamps with explicit timezone offsets.",
+            "Extract only meeting details explicitly supported by the email. "
+            "Return the exact date phrase, start-time phrase, optional end-time "
+            "phrase, optional duration phrase, and optional explicit timezone "
+            "phrase as written; do not calculate dates or convert timezones. "
+            "Do not infer AM/PM, a duration, an end time, a date, or a year. "
+            "Leave a field empty if it is missing or unclear. The received-at "
+            "timestamp below is already converted to Asia/Kolkata and is the "
+            "only reference date for interpreting relative-date wording later.",
         ),
         (
             "human",
-            "Email received at: {email_received_at}\n"
+            "Email received at (Asia/Kolkata): {email_received_at}\n"
             "Sender: {sender}\nSubject: {subject}\nBody:\n{body}",
         ),
     ])
@@ -153,8 +163,14 @@ def scheduler_node(
     result: CalendarEventDraft = chain.invoke({
         "sender": state["sender"],
         "subject": state["subject"],
-        "body": state["body"],
-        "email_received_at": email_received_at or "unknown",
+        "body": email_body,
+        "email_received_at": received_at_ist or "unavailable",
     })
 
-    return {"calendar_event": result.model_dump()}
+    return {
+        "calendar_event": resolve_calendar_event_draft(
+            result.model_dump(),
+            source_text=f"{state['subject']}\n{email_body}",
+            received_at=email_received_at,
+        )
+    }

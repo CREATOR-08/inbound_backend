@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -119,6 +120,22 @@ class AssistantGraphTests(unittest.TestCase):
             })
         self.assertEqual(result["response"]["intent"], "QUESTION")
         self.assertEqual(result["response"]["message"], "The sender requests a reply.")
+
+    def test_answer_question_streams_only_when_requested(self):
+        model = SimpleNamespace(
+            stream=lambda _prompt: iter([
+                SimpleNamespace(content="A concise "),
+                SimpleNamespace(content="answer."),
+            ])
+        )
+        with patch.object(nodes, "get_model", return_value=model) as get_model:
+            update = nodes.answer_question({
+                "message": "Answer this",
+                "retrieved_context": {},
+                "stream_response": True,
+            })
+        get_model.assert_called_once_with("reasoning")
+        self.assertEqual(update["response"]["message"], "A concise answer.")
 
     def test_question_fetches_selected_email_only_when_relevant(self):
         state = {
@@ -668,6 +685,96 @@ class AssistantApiTests(unittest.TestCase):
             self.assertNotIn("user_account", invocation_state)
         finally:
             app.dependency_overrides.pop(dependencies.get_current_user, None)
+
+    def test_assistant_stream_endpoint_emits_safe_token_and_done_events(self):
+        from app.main import app
+
+        app.dependency_overrides[dependencies.get_current_user] = lambda: AuthenticatedUser(
+            id="u1",
+            email="user@example.com",
+        )
+        response_data = {
+            "status": "success",
+            "intent": "QUESTION",
+            "message": 'Hello\n"world"',
+            "data": None,
+            "actions": [],
+            "requires_confirmation": False,
+            "requires_clarification": False,
+        }
+        graph_events = iter([
+            (
+                "messages",
+                (SimpleNamespace(content='Hello\n"'), {"langgraph_node": "answer_question"}),
+            ),
+            (
+                "messages",
+                (SimpleNamespace(content="ignored"), {"langgraph_node": "classify_intent"}),
+            ),
+            ("messages", (SimpleNamespace(content='world"'), {"langgraph_node": "answer_question"})),
+            ("values", {"response": response_data}),
+        ])
+        try:
+            with (
+                patch(
+                    "app.api.routes.assistant.assistant_graph.stream",
+                    return_value=graph_events,
+                ) as stream,
+                TestClient(app) as client,
+            ):
+                response = client.post(
+                    "/api/v1/assistant/command/stream",
+                    json={"message": "Hello", "session_id": "s1"},
+                )
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.headers["content-type"].startswith("text/event-stream"))
+            self.assertIn("Cache-Control", response.headers)
+            events = [
+                (block.splitlines()[0][7:], json.loads(block.splitlines()[1][6:]))
+                for block in response.text.strip().split("\n\n")
+            ]
+            self.assertEqual(
+                events,
+                [
+                    ("token", 'Hello\n"'),
+                    ("token", 'world"'),
+                    ("done", response_data),
+                ],
+            )
+            self.assertTrue(stream.call_args.kwargs["stream_mode"] == ["messages", "values"])
+        finally:
+            app.dependency_overrides.pop(dependencies.get_current_user, None)
+
+    def test_assistant_stream_hides_errors_and_closes_graph_on_disconnect(self):
+        from app.api.routes.assistant import _stream_assistant_response
+
+        def disconnected_graph(*_args, **_kwargs):
+            try:
+                yield (
+                    "messages",
+                    (SimpleNamespace(content="partial"), {"langgraph_node": "answer_question"}),
+                )
+                yield ("values", {"response": {"message": "done", "status": "success"}})
+            finally:
+                closed.append(True)
+
+        closed = []
+        with patch(
+            "app.api.routes.assistant.assistant_graph.stream",
+            side_effect=disconnected_graph,
+        ):
+            events = _stream_assistant_response({})
+            self.assertIn('event: token\ndata: "partial"', next(events))
+            events.close()
+        self.assertEqual(closed, [True])
+
+        with patch(
+            "app.api.routes.assistant.assistant_graph.stream",
+            side_effect=RuntimeError("secret provider diagnostic"),
+        ):
+            failure = "".join(_stream_assistant_response({}))
+        self.assertIn("event: error", failure)
+        self.assertNotIn("secret provider diagnostic", failure)
 
 
 class AssistantQueryTests(unittest.TestCase):

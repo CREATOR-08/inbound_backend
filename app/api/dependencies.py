@@ -14,7 +14,7 @@ from app.api.google_profile_cache import (
     google_profile_verification_cache,
     invalidate_google_profile_verification,
 )
-from app.db.database import SessionLocal
+from app.db.database import SessionLocal, log_database_timing
 from app.db.models import UserAccount
 from app.services.gmail import (
     GmailReauthorizationRequired,
@@ -66,14 +66,25 @@ def _persist_account_token_state(
     *,
     expected_access_token: str | None | object = _ANY_ACCESS_TOKEN,
 ) -> bool:
+    persistence_started = perf_counter()
     db = SessionLocal()
     try:
-        user = (
-            db.query(UserAccount)
-            .filter(UserAccount.id == user_id)
-            .with_for_update()
-            .first()
-        )
+        lock_query_started = perf_counter()
+        lock_query_succeeded = False
+        try:
+            user = (
+                db.query(UserAccount)
+                .filter(UserAccount.id == user_id)
+                .with_for_update()
+                .first()
+            )
+            lock_query_succeeded = True
+        finally:
+            log_database_timing(
+                "token_select_for_update",
+                duration_ms=f"{(perf_counter() - lock_query_started) * 1000:.1f}",
+                succeeded=lock_query_succeeded,
+            )
         if user is None:
             raise RuntimeError("Gmail account disappeared while saving credentials.")
         if (
@@ -100,7 +111,13 @@ def _persist_account_token_state(
         db.rollback()
         raise
     finally:
-        db.close()
+        try:
+            db.close()
+        finally:
+            log_database_timing(
+                "token_persistence",
+                duration_ms=f"{(perf_counter() - persistence_started) * 1000:.1f}",
+            )
 
 
 def _resolve_user_account(
@@ -108,6 +125,7 @@ def _resolve_user_account(
     db: Session,
     create: bool = False,
     timing_context: str | None = None,
+    skip_cached_token_persistence: bool = False,
 ) -> tuple[UserAccount, str]:
     request_started = perf_counter()
     database_ms = 0.0
@@ -431,7 +449,14 @@ def _resolve_user_account(
             db.flush()
             created_account = True
 
-    if not created_account:
+    safe_cached_identity = (
+        skip_cached_token_persistence
+        and profile_cache_hit
+        and token_user_state is not None
+        and user.id == token_user_state["id"]
+        and active_token == access_token
+    )
+    if not created_account and not safe_cached_identity:
         if persisted_token_state["user_id"] is None:
             persisted_token_state["user_id"] = user.id
             persisted_token_state["access_token"] = user.access_token

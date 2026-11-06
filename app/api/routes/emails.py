@@ -20,7 +20,7 @@ from fastapi import (
     Query,
     Response,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from googleapiclient.errors import HttpError
 from sqlalchemy import and_, func, or_
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -318,6 +318,108 @@ def _store_email_if_new(db: Session, user: UserAccount, email_data: dict) -> boo
         )
     )
     return True
+
+
+INITIAL_EMAIL_INSERT_BATCH_SIZE = 500
+
+
+def _store_initial_emails(
+    db: Session,
+    user: UserAccount,
+    email_data_items: list[dict],
+) -> int:
+    unique_email_data = []
+    seen_ids: set[str] = set()
+    for email_data in email_data_items:
+        message_id = email_data["id"]
+        if message_id not in seen_ids:
+            seen_ids.add(message_id)
+            unique_email_data.append(email_data)
+
+    if db.get_bind().dialect.name != "postgresql":
+        return sum(
+            _store_email_if_new(db, user, email_data)
+            for email_data in unique_email_data
+        )
+
+    imported_count = 0
+    for batch_start in range(
+        0,
+        len(unique_email_data),
+        INITIAL_EMAIL_INSERT_BATCH_SIZE,
+    ):
+        batch = unique_email_data[
+            batch_start : batch_start + INITIAL_EMAIL_INSERT_BATCH_SIZE
+        ]
+        email_rows = [
+            {
+                "id": email_data["id"],
+                "thread_id": email_data["thread_id"],
+                "user_id": user.id,
+                "sender": email_data["sender"],
+                "subject": email_data["subject"],
+                "preview": email_data["preview"],
+                "body": email_data["body"],
+                "body_html": email_data["body_html"],
+                "has_html": email_data["has_html"],
+                "created_at": email_data["received_at"],
+                "is_read": bool(email_data.get("is_read", False)),
+            }
+            for email_data in batch
+        ]
+        inserted_ids = (
+            db.execute(
+                postgresql_insert(Email)
+                .values(email_rows)
+                .on_conflict_do_nothing(index_elements=[Email.id])
+                .returning(Email.id)
+            )
+            .scalars()
+            .all()
+        )
+        imported_count += len(inserted_ids)
+
+        if len(inserted_ids) < len(batch):
+            rejected_ids = [
+                email_data["id"]
+                for email_data in batch
+                if email_data["id"] not in inserted_ids
+            ]
+            conflicting_ids = (
+                db.query(Email.id)
+                .filter(
+                    Email.id.in_(rejected_ids),
+                    or_(
+                        Email.user_id != user.id,
+                        Email.user_id.is_(None),
+                    ),
+                )
+                .all()
+            )
+            if conflicting_ids:
+                logger.error(
+                    "Gmail message ID collision across accounts; refusing to reassign it"
+                )
+
+        if inserted_ids:
+            state_rows = [
+                {
+                    "email_id": email_id,
+                    "category": None,
+                    "priority": None,
+                    "is_archived": False,
+                }
+                for email_id in inserted_ids
+            ]
+            db.execute(
+                postgresql_insert(EmailAgentStateModel)
+                .values(state_rows)
+                .on_conflict_do_nothing(
+                    index_elements=[EmailAgentStateModel.email_id]
+                )
+            )
+
+    return imported_count
 
 
 def tag_recent_untagged_emails(user_id: str, limit: int = 10) -> None:
@@ -682,10 +784,7 @@ def run_initial_gmail_sync(user_id: str) -> None:
                 user.initial_sync_status = "completed"
                 db.commit()
                 return
-            imported_count = sum(
-                _store_email_if_new(db, user, email_data)
-                for email_data in fetched_emails
-            )
+            imported_count = _store_initial_emails(db, user, fetched_emails)
             user.last_history_id = (
                 _latest_history_id(user.last_history_id, latest_history_id)
                 or start_history_id
@@ -935,8 +1034,8 @@ def get_initial_sync_status(
         _get_bearer_token(authorization),
         db,
         timing_context="get_initial_sync_status",
+        skip_cached_token_persistence=True,
     )
-    db.commit()
     initial_sync_status = getattr(user, "initial_sync_status", None)
     if (
         user.initial_sync_eligible
@@ -1520,27 +1619,38 @@ def get_email_body(
     request_started = perf_counter()
     auth_started = perf_counter()
     user, active_token = _resolve_user_account(
-        _get_bearer_token(authorization), db, timing_context="email_body"
+        _get_bearer_token(authorization),
+        db,
+        timing_context="email_body",
+        skip_cached_token_persistence=True,
     )
     auth_ms = (perf_counter() - auth_started) * 1000
     database_started = perf_counter()
-    db.commit()
     email = (
-        db.query(Email).filter(Email.id == email_id, Email.user_id == user.id).first()
+        db.query(Email)
+        .options(
+            load_only(
+                Email.id,
+                Email.body,
+                Email.body_html,
+                Email.is_read,
+            )
+        )
+        .filter(Email.id == email_id, Email.user_id == user.id)
+        .first()
     )
     database_ms = (perf_counter() - database_started) * 1000
-    logger.info(
-        "email_body_request_timing auth_ms=%.1f database_ms=%.1f total_ms=%.1f",
-        auth_ms,
-        database_ms,
-        (perf_counter() - request_started) * 1000,
-    )
     if not email:
         raise HTTPException(status_code=404, detail="Email not found")
 
+    read_status_database_ms = 0.0
+    gmail_read_sync_ms = 0.0
     if not email.is_read:
         email.is_read = True
+        read_status_started = perf_counter()
         db.commit()
+        read_status_database_ms += (perf_counter() - read_status_started) * 1000
+        gmail_started = perf_counter()
         try:
             update_gmail_message_read_status(
                 access_token=active_token,
@@ -1564,12 +1674,30 @@ def get_email_body(
                 email.id,
                 exc_info=True,
             )
+        finally:
+            gmail_read_sync_ms = (perf_counter() - gmail_started) * 1000
 
-    return {
+    response_data = {
         "email_id": email.id,
         "body": email.body or "",
         "body_html": email.body_html or "",
     }
+    serialization_started = perf_counter()
+    response = JSONResponse(content=response_data)
+    serialization_ms = (perf_counter() - serialization_started) * 1000
+    logger.info(
+        "email_body_request_timing auth_resolution_ms=%.1f "
+        "database_query_ms=%.1f read_status_database_ms=%.1f "
+        "gmail_read_sync_ms=%.1f result_serialization_ms=%.1f "
+        "total_endpoint_duration_ms=%.1f",
+        auth_ms,
+        database_ms,
+        read_status_database_ms,
+        gmail_read_sync_ms,
+        serialization_ms,
+        (perf_counter() - request_started) * 1000,
+    )
+    return response
 
 
 @router.get("/emails/{email_id}")

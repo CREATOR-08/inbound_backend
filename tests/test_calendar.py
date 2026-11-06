@@ -1,13 +1,15 @@
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
+from googleapiclient.errors import HttpError
 
 from app.agent.nodes import scheduler_node
 from app.agent.state import CalendarEventDraft
 from app.api.routes import calendar as calendar_routes
-from app.api.schemas.schemas import CalendarApprovalRequest
+from app.api.schemas.schemas import CalendarApprovalRequest, EmailActionRequest
 from app.services.calendar import (
     create_google_calendar_event,
     normalize_calendar_event_times,
@@ -16,6 +18,150 @@ from app.api.routes.calendar import _schedule_proposal_times
 
 
 class CalendarTimestampTests(unittest.TestCase):
+    def test_schedule_rejects_preview_only_when_full_body_is_empty(self):
+        user = SimpleNamespace(id="user-1")
+        email = SimpleNamespace(
+            id="email-1",
+            subject="Planning",
+            body="",
+            body_html="",
+            preview="Meet me tomorrow at 7 PM.",
+            created_at=datetime(2026, 10, 28, 15, 0, tzinfo=timezone.utc),
+        )
+        with (
+            patch.object(
+                calendar_routes,
+                "_resolve_user_account",
+                return_value=(user, "token"),
+            ),
+            patch.object(calendar_routes, "_get_bearer_token", return_value="token"),
+            patch.object(
+                calendar_routes,
+                "_get_email_action_state",
+                return_value=(email, None),
+            ),
+            patch.object(calendar_routes, "_build_action_state", return_value={}),
+            patch.object(calendar_routes, "scheduler_node") as scheduler,
+        ):
+            with self.assertRaises(HTTPException) as error:
+                calendar_routes.generate_schedule(
+                    EmailActionRequest(email_id="email-1"),
+                    authorization="token",
+                    db=MagicMock(),
+                )
+        self.assertEqual(error.exception.status_code, 422)
+        self.assertIn("no readable body", error.exception.detail)
+        scheduler.assert_not_called()
+
+    def test_schedule_saves_draft_without_calling_google_calendar(self):
+        user = SimpleNamespace(id="user-1")
+        email = SimpleNamespace(
+            id="email-1",
+            subject="Planning",
+            body="",
+            body_html="<p>The complete meeting message</p>",
+            created_at=datetime(2026, 10, 28, 15, 0, tzinfo=timezone.utc),
+        )
+        draft_db = MagicMock()
+        draft_db.query.return_value.join.return_value.filter.return_value.first.return_value = None
+        draft_db.refresh.side_effect = lambda draft: setattr(draft, "id", "draft-1")
+        request_db = MagicMock()
+        event = {
+            "title": "Planning",
+            "start_time": "2026-10-31T14:35:00Z",
+            "end_time": "2026-10-31T15:35:00Z",
+            "attendees": ["person@example.com"],
+            "confidence": 0.9,
+        }
+        with (
+            patch.object(
+                calendar_routes,
+                "_resolve_user_account",
+                return_value=(user, "token"),
+            ),
+            patch.object(calendar_routes, "_get_bearer_token", return_value="token"),
+            patch.object(
+                calendar_routes,
+                "_get_email_action_state",
+                return_value=(email, None),
+            ) as get_email,
+            patch.object(calendar_routes, "_build_action_state", return_value={}),
+            patch.object(
+                calendar_routes,
+                "scheduler_node",
+                return_value={"calendar_event": event},
+            ) as scheduler,
+            patch.object(calendar_routes, "SessionLocal", return_value=draft_db),
+            patch("googleapiclient.discovery.build") as build_calendar_service,
+        ):
+            response = calendar_routes.generate_schedule(
+                EmailActionRequest(email_id="email-1"),
+                authorization="Bearer token",
+                db=request_db,
+            )
+
+        get_email.assert_called_once_with("email-1", "user-1", request_db)
+        scheduler.assert_called_once()
+        self.assertEqual(
+            scheduler.call_args.args[0]["body"],
+            "The complete meeting message",
+        )
+        self.assertEqual(
+            scheduler.call_args.args[1],
+            "2026-10-28T15:00:00+00:00",
+        )
+        build_calendar_service.assert_not_called()
+        self.assertEqual(response["calendar_event"]["draft_id"], "draft-1")
+        self.assertEqual(response["calendar_event"]["status"], "PENDING")
+        self.assertEqual(draft_db.add.call_args.args[0].email_id, "email-1")
+
+    def test_confirmation_calls_calendar_api_and_translates_permission_errors(self):
+        draft = SimpleNamespace(
+            id="draft-1",
+            email_id="email-1",
+            status="PENDING",
+            google_event_id=None,
+            title="Planning",
+            start_time="2026-10-31T20:05:00+05:30",
+            end_time="2026-10-31T21:05:00+05:30",
+            attendees=[],
+        )
+
+        request = CalendarApprovalRequest(draft_id="draft-1")
+        with (
+            patch.object(
+                calendar_routes,
+                "_resolve_user_account",
+                return_value=(SimpleNamespace(id="user-1"), "token"),
+            ),
+            patch.object(calendar_routes, "_get_bearer_token", return_value="token"),
+        ):
+            for status in (401, 403):
+                with self.subTest(status=status):
+                    db = MagicMock()
+                    db.query.return_value.join.return_value.filter.return_value.first.return_value = draft
+                    with patch.object(
+                        calendar_routes,
+                        "create_google_calendar_event",
+                        side_effect=HttpError(
+                            SimpleNamespace(status=status, reason="Forbidden"),
+                            b"permission denied",
+                        ),
+                    ) as create_event:
+                        with self.assertRaises(HTTPException) as error:
+                            calendar_routes.confirm_calendar_event(
+                                request,
+                                authorization="Bearer token",
+                                db=db,
+                            )
+
+                    create_event.assert_called_once()
+                    self.assertEqual(error.exception.status_code, 403)
+                    self.assertEqual(
+                        error.exception.detail,
+                        calendar_routes.CALENDAR_PERMISSION_MESSAGE,
+                    )
+
     def test_schedule_extraction_receives_email_received_timestamp(self):
         chain = MagicMock()
         prompt = MagicMock()
@@ -50,7 +196,11 @@ class CalendarTimestampTests(unittest.TestCase):
         chain.invoke.assert_called_once()
         self.assertEqual(
             chain.invoke.call_args.args[0]["email_received_at"],
-            "2026-10-28T15:00:00+00:00",
+            "2026-10-28T20:30:00+05:30",
+        )
+        self.assertEqual(
+            chain.invoke.call_args.args[0]["body"],
+            "Let's meet next Monday.",
         )
         self.assertEqual(result["calendar_event"]["confidence"], 0.0)
 

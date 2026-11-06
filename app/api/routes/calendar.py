@@ -3,9 +3,6 @@ import logging
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from google.auth.exceptions import GoogleAuthError
-from google.auth.transport.requests import Request as GoogleAuthRequest
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from sqlalchemy.orm import Session
 
@@ -22,6 +19,7 @@ from app.services.calendar import (
     create_google_calendar_event,
     normalize_calendar_event_times,
 )
+from app.services.gmail import clean_text_for_llm, html_to_text
 
 logger = logging.getLogger(__name__)
 action_router = APIRouter()
@@ -41,6 +39,15 @@ def _schedule_proposal_times(
     event: dict,
 ) -> tuple[str, str, float, str | None]:
     """Validate and normalize proposed event times."""
+    extraction_status = event.get("extraction_status")
+    if extraction_status in {"missing", "ambiguous", "invalid"}:
+        message = event.get("ambiguity")
+        return "", "", 0.0, (
+            message
+            if isinstance(message, str) and message.strip()
+            else "Please provide a complete, unambiguous meeting date, time, and duration."
+        )
+
     confidence = float(event.get("confidence", 0.0))
 
     if confidence <= 0:
@@ -54,63 +61,6 @@ def _schedule_proposal_times(
     return start_time, end_time, confidence, None
 
 
-def _check_calendar_access(access_token: str) -> None:
-    """
-    Verify that the current Google access token can access Calendar.
-
-    This allows /schedule to detect missing Calendar permissions before
-    generating and saving a calendar draft.
-    """
-    credentials = Credentials(token=access_token)
-
-    try:
-        calendar_service = build(
-            "calendar",
-            "v3",
-            credentials=credentials,
-            cache_discovery=False,
-        )
-
-        # A lightweight read request verifies Calendar API access.
-        calendar_service.calendarList().list(maxResults=1).execute()
-
-    except HttpError as exc:
-        status = getattr(getattr(exc, "resp", None), "status", None)
-
-        if status in (401, 403):
-            logger.warning(
-                "Google Calendar access check failed with HTTP %s",
-                status,
-            )
-            raise HTTPException(
-                status_code=403,
-                detail=CALENDAR_PERMISSION_MESSAGE,
-            ) from exc
-
-        logger.exception("Google Calendar access check failed")
-        raise HTTPException(
-            status_code=502,
-            detail="Unable to verify Google Calendar access. Please try again.",
-        ) from exc
-
-    except GoogleAuthError as exc:
-        logger.warning("Google credentials could not be used for Calendar access")
-        raise HTTPException(
-            status_code=401,
-            detail=(
-                "Your Google access token is invalid or expired. "
-                "Reconnect your Google account and try again."
-            ),
-        ) from exc
-
-    except Exception as exc:
-        logger.exception("Unexpected error while checking Calendar access")
-        raise HTTPException(
-            status_code=502,
-            detail="Unable to verify Google Calendar access. Please try again.",
-        ) from exc
-
-
 @action_router.post("/schedule")
 def generate_schedule(
     req: EmailActionRequest,
@@ -118,19 +68,27 @@ def generate_schedule(
     db: Session = Depends(get_db),
 ):
     """
-    Verify Calendar access, extract a calendar proposal, and save a draft.
+    Extract a calendar proposal and save a draft.
     This endpoint does not create a Google Calendar event.
     """
-    user, token = _resolve_user_account(
+    user, _token = _resolve_user_account(
         _get_bearer_token(authorization),
         db,
     )
 
-    # AUTH-08: fail early if the user has not granted Calendar access.
-    _check_calendar_access(token)
-
     email, _ = _get_email_action_state(req.email_id, user.id, db)
     action_state = _build_action_state(email)
+    email_body = (
+        email.body.strip()
+        if isinstance(email.body, str) and email.body.strip()
+        else html_to_text(email.body_html or "")
+    )
+    if not clean_text_for_llm(email_body):
+        raise HTTPException(
+            status_code=422,
+            detail="This email has no readable body. Meeting details cannot be extracted.",
+        )
+    action_state["body"] = email_body
 
     email_id = email.id
     email_subject = email.subject
@@ -169,20 +127,25 @@ def generate_schedule(
             detail="Unable to generate the meeting schedule. Please try again.",
         ) from exc
 
+    extraction_status = event.get("extraction_status", "complete")
     try:
         start_time, end_time, confidence, ambiguity = (
             _schedule_proposal_times(event)
         )
 
-    except (ValueError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError):
         logger.warning(
             "Schedule extraction returned invalid event data for email %s",
             req.email_id,
         )
-        raise HTTPException(
-            status_code=502,
-            detail="Schedule extraction returned invalid event times.",
-        ) from exc
+        start_time, end_time, confidence = "", "", 0.0
+        ambiguity = (
+            "I couldn't validate the extracted meeting date or time. "
+            "Please enter the date and time manually."
+        )
+        extraction_status = "invalid"
+    if confidence <= 0 and extraction_status == "complete":
+        extraction_status = "ambiguous"
 
     draft_db = SessionLocal()
 
@@ -238,6 +201,7 @@ def generate_schedule(
                 "attendees": draft.attendees or [],
                 "confidence": float(draft.confidence or 0),
                 "ambiguity": ambiguity,
+                "extraction_status": extraction_status,
                 "status": draft.status,
             },
         }

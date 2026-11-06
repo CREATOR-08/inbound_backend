@@ -275,6 +275,7 @@ class EmailReadStatusTests(unittest.TestCase):
             with (
                 patch.object(emails, "_resolve_user_account", return_value=(self.user, "token")),
                 patch.object(emails, "update_gmail_message_read_status") as mock_gmail_sync,
+                patch.object(emails, "fetch_single_email") as mock_fetch_email,
                 TestClient(app) as client,
             ):
                 res = client.get(
@@ -286,6 +287,7 @@ class EmailReadStatusTests(unittest.TestCase):
                 self.assertTrue(email_obj.is_read)
                 self.assertTrue(db.committed)
                 mock_gmail_sync.assert_called_once()
+                mock_fetch_email.assert_not_called()
                 call_kwargs = mock_gmail_sync.call_args.kwargs
                 self.assertEqual(call_kwargs["access_token"], "token")
                 self.assertEqual(call_kwargs["message_id"], "email-unread")
@@ -299,6 +301,81 @@ class EmailReadStatusTests(unittest.TestCase):
                 )
                 self.assertEqual(res2.status_code, 200)
                 mock_gmail_sync.assert_not_called()
+        finally:
+            app.dependency_overrides.pop(emails.get_db, None)
+
+    def test_body_endpoint_does_not_expose_another_users_email(self):
+        email_obj = SimpleNamespace(
+            id="email-owned-by-someone-else",
+            user_id="user-2",
+            body="Private body",
+            body_html="<p>Private body</p>",
+            is_read=True,
+        )
+        db = FakeDatabaseSession([email_obj])
+
+        def override_get_db():
+            yield db
+
+        app.dependency_overrides[emails.get_db] = override_get_db
+        try:
+            with (
+                patch.object(
+                    emails,
+                    "_resolve_user_account",
+                    return_value=(self.user, "token"),
+                ),
+                patch.object(emails, "_get_bearer_token", return_value="token"),
+                TestClient(app) as client,
+            ):
+                response = client.get(
+                    "/api/v1/emails/email-owned-by-someone-else/body",
+                    headers={"Authorization": "******"},
+                )
+            self.assertEqual(response.status_code, 404)
+        finally:
+            app.dependency_overrides.pop(emails.get_db, None)
+
+    def test_body_endpoint_logs_stages_and_uses_verified_cache_fast_path(self):
+        email_obj = SimpleNamespace(
+            id="email-read",
+            user_id="user-1",
+            body="Stored body",
+            body_html="<p>Stored body</p>",
+            is_read=True,
+        )
+        db = FakeDatabaseSession([email_obj])
+
+        def override_get_db():
+            yield db
+
+        app.dependency_overrides[emails.get_db] = override_get_db
+        try:
+            with (
+                patch.object(
+                    emails,
+                    "_resolve_user_account",
+                    return_value=(self.user, "token"),
+                ) as resolver,
+                patch.object(emails, "_get_bearer_token", return_value="token"),
+                self.assertLogs("app.api.routes.emails", level="INFO") as captured,
+                TestClient(app) as client,
+            ):
+                response = client.get(
+                    "/api/v1/emails/email-read/body",
+                    headers={"Authorization": "******"},
+                )
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(resolver.call_args.kwargs["skip_cached_token_persistence"])
+            logs = "\n".join(captured.output)
+            for stage in (
+                "auth_resolution_ms=",
+                "database_query_ms=",
+                "gmail_read_sync_ms=",
+                "result_serialization_ms=",
+                "total_endpoint_duration_ms=",
+            ):
+                self.assertIn(stage, logs)
         finally:
             app.dependency_overrides.pop(emails.get_db, None)
 

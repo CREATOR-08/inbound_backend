@@ -20,6 +20,7 @@ class AssistantState(TypedDict, total=False):
     confirm_workflow: bool
     approved_workflow: list[dict[str, Any]] | None
     query_context: dict[str, Any] | None
+    stream_response: bool
 
     # Context supplied by the application. Do not assume it is trusted.
     page_context: dict[str, Any]

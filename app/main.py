@@ -1,10 +1,15 @@
 import logging
 import os
+import uuid
 from time import perf_counter
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
+from app.db.database import (
+    reset_database_request_context,
+    set_database_request_context,
+)
 
 application_logger = logging.getLogger("app")
 application_logger.setLevel(logging.INFO)
@@ -29,9 +34,17 @@ _TIMED_EMAIL_ENDPOINTS = {
 @app.middleware("http")
 async def log_email_endpoint_timing(request, call_next):
     endpoint = _TIMED_EMAIL_ENDPOINTS.get(request.url.path)
+    if (
+        endpoint is None
+        and request.url.path.startswith("/api/v1/emails/")
+        and request.url.path.endswith("/body")
+    ):
+        endpoint = "email_body"
     if endpoint is None:
         return await call_next(request)
 
+    request_id = uuid.uuid4().hex
+    context_token = set_database_request_context(endpoint, request_id)
     started = perf_counter()
     status_code = 500
     try:
@@ -39,12 +52,14 @@ async def log_email_endpoint_timing(request, call_next):
         status_code = response.status_code
         return response
     finally:
+        reset_database_request_context(context_token)
         logger.info(
             "email_endpoint_timing endpoint=%s total_endpoint_duration_ms=%.1f "
-            "status_code=%s",
+            "status_code=%s request_id=%s",
             endpoint,
             (perf_counter() - started) * 1000,
             status_code,
+            request_id,
         )
 
 frontend_origins = [

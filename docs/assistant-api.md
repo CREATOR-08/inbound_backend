@@ -4,6 +4,27 @@ The existing endpoint remains `POST /api/v1/assistant/command`. It still uses
 the existing Google bearer-token authentication. The backend derives the user
 from the verified Google profile; clients must not send a user ID.
 
+## Streaming response
+
+Chat clients can use `POST /api/v1/assistant/command/stream` with the same
+authentication and JSON request body. It returns `text/event-stream` events:
+
+```text
+event: token
+data: "Generated text"
+
+event: done
+data: {"status":"success","intent":"QUESTION","message":"Generated text", ...}
+```
+
+Token payloads are JSON strings, so newlines and special characters are escaped.
+The `done` payload is the usual assistant response envelope, including actions
+and data. A generic `error` event is sent if generation fails. Conversational
+question answers stream as generated; structured intent classification, action
+planning, and workflow execution continue to run as before. Other response
+types are sent as one token when the graph completes. The original
+`/assistant/command` JSON endpoint remains available for existing clients.
+
 ## Request
 
 ```json
@@ -256,9 +277,9 @@ populate local data.
 - Render `requires_clarification` as a follow-up question and
   `requires_confirmation` as a confirmation prompt. Do not treat either as a
   completed operation.
-- The endpoint is unchanged; request fields are additive. Existing clients can
-  continue sending `message`, `session_id`, `page_context`, and
-  `conversation_history`. `query_context` is optional and is used only for
+- Both command endpoints accept the same request fields. Existing clients can
+  continue using the JSON endpoint with `message`, `session_id`, `page_context`,
+  and `conversation_history`. `query_context` is optional and is used only for
   validated next-page requests. Clients must adopt the new response envelope
   and uppercase action names.
 
