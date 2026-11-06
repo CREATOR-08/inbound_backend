@@ -12,7 +12,6 @@ from typing import Callable, Optional
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Body,
     Depends,
     Header,
@@ -47,8 +46,29 @@ from app.api.schemas.schemas import (
     InitialSyncStatusResponse,
     PubSubPushRequest,
 )
+from app.core.queues import (
+    QueueUnavailableError,
+    ai_queue,
+    enqueue_job,
+    gmail_queue,
+    has_active_job,
+)
 from app.db.database import SessionLocal, get_db
 from app.db.models import Email, EmailAgentStateModel, UserAccount
+from app.jobs.ai import tag_recent_untagged_emails_job
+from app.jobs.gmail import (
+    run_existing_account_catchup_job,
+    run_initial_gmail_sync_job,
+    run_incremental_recovery_job,
+    run_pubsub_gmail_sync_job,
+)
+from app.jobs.reliability import (
+    incremental_sync_job_id,
+    initial_sync_job_id,
+    is_retryable_error,
+    pubsub_execution_id,
+    tagging_job_id,
+)
 from app.services.gmail import (
     GmailHistoryCursorExpired,
     GmailReauthorizationRequired,
@@ -69,6 +89,72 @@ action_router = APIRouter()
 INITIAL_SYNC_RECOVERY_TIMEOUT_SECONDS = 300
 DEFAULT_INITIAL_GMAIL_FETCH_CONCURRENCY = 5
 INITIAL_GMAIL_MESSAGE_FETCH_RETRIES = 2
+
+
+def _enqueue_initial_sync(user_id: str, *, recover_stale: bool = False) -> None:
+    try:
+        if recover_stale and has_active_job(
+            gmail_queue,
+            initial_sync_job_id(user_id),
+        ):
+            return
+        enqueue_job(
+            gmail_queue,
+            run_initial_gmail_sync_job,
+            user_id,
+            job_id=initial_sync_job_id(user_id),
+        )
+    except QueueUnavailableError as error:
+        reset_db: Session = SessionLocal()
+        try:
+            reset_db.query(UserAccount).filter(
+                UserAccount.id == user_id,
+                UserAccount.initial_sync_eligible.is_(True),
+                UserAccount.initial_sync_completed_at.is_(None),
+                UserAccount.initial_sync_status.in_(("pending", "running")),
+            ).update(
+                {
+                    UserAccount.initial_sync_status: "pending",
+                    UserAccount.updated_at: datetime.now(timezone.utc)
+                    - timedelta(seconds=INITIAL_SYNC_RECOVERY_TIMEOUT_SECONDS + 1),
+                },
+                synchronize_session=False,
+            )
+            reset_db.commit()
+        except Exception:
+            reset_db.rollback()
+            logger.exception(
+                "Could not restore initial sync state after queue failure for user_id=%s",
+                user_id,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Redis is unavailable and the initial sync state could not "
+                    "be restored."
+                ),
+            ) from error
+        finally:
+            reset_db.close()
+        raise HTTPException(
+            status_code=503,
+            detail="Redis is unavailable. Initial Gmail synchronization was not queued.",
+        ) from error
+
+
+def _enqueue_recent_email_tagging(user_id: str) -> None:
+    try:
+        enqueue_job(
+            ai_queue,
+            tag_recent_untagged_emails_job,
+            user_id,
+            job_id=tagging_job_id(user_id),
+        )
+    except QueueUnavailableError:
+        logger.exception(
+            "Could not queue email tagging because Redis is unavailable for user_id=%s",
+            user_id,
+        )
 
 
 def _initial_gmail_fetch_concurrency() -> int:
@@ -428,6 +514,7 @@ def tag_recent_untagged_emails(user_id: str, limit: int = 10) -> None:
     attempted_ids: set[str] = set()
     processed = 0
     updated = 0
+    retryable_error: Exception | None = None
     while processed < limit:
         db: Session = SessionLocal()
         try:
@@ -461,7 +548,7 @@ def tag_recent_untagged_emails(user_id: str, limit: int = 10) -> None:
                 attempted_ids.add(email_id)
         except Exception:
             logger.exception("Failed selecting untagged emails for user_id=%s", user_id)
-            return
+            raise
         finally:
             db.close()
 
@@ -481,10 +568,12 @@ def tag_recent_untagged_emails(user_id: str, limit: int = 10) -> None:
             priority = result.get("priority")
             if category not in VALID_CATEGORIES or priority not in VALID_PRIORITIES:
                 raise ValueError("Triage returned an invalid category or priority")
-        except Exception:
+        except Exception as error:
             logger.exception(
                 "Failed to tag email_id=%s for user_id=%s", email_id, user_id
             )
+            if is_retryable_error(error):
+                retryable_error = error
             continue
 
         db = SessionLocal()
@@ -516,9 +605,11 @@ def tag_recent_untagged_emails(user_id: str, limit: int = 10) -> None:
                 priority,
                 is_archived,
             )
-        except Exception:
+        except Exception as error:
             db.rollback()
             logger.exception("Failed to persist triage for email_id=%s", email_id)
+            if is_retryable_error(error):
+                retryable_error = error
         finally:
             db.close()
     logger.info(
@@ -527,6 +618,8 @@ def tag_recent_untagged_emails(user_id: str, limit: int = 10) -> None:
         processed,
         updated,
     )
+    if retryable_error is not None:
+        raise retryable_error
 
 
 @router.post("/emails/watch")
@@ -577,6 +670,15 @@ def _mark_initial_sync_failed(user_id: str) -> None:
 
 
 def _claim_stale_initial_sync(db: Session, user_id: str) -> int:
+    try:
+        active = has_active_job(gmail_queue, initial_sync_job_id(user_id))
+    except QueueUnavailableError as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Redis is unavailable while checking initial sync status.",
+        ) from error
+    if active:
+        return 0
     recovery_cutoff = datetime.now(timezone.utc) - timedelta(
         seconds=INITIAL_SYNC_RECOVERY_TIMEOUT_SECONDS
     )
@@ -592,14 +694,117 @@ def _claim_stale_initial_sync(db: Session, user_id: str) -> int:
         .filter(
             UserAccount.id == user_id,
             UserAccount.initial_sync_eligible.is_(True),
-            UserAccount.initial_sync_status == "pending",
+            UserAccount.initial_sync_completed_at.is_(None),
+            UserAccount.initial_sync_status.in_(("pending", "running")),
             stale_claim,
         )
         .update(
-            {UserAccount.updated_at: func.now()},
+            {
+                UserAccount.initial_sync_status: "pending",
+                UserAccount.updated_at: func.now(),
+            },
             synchronize_session=False,
         )
     )
+
+
+def _claim_stale_incremental_sync(
+    user_id: str,
+    execution_id: str | None,
+) -> bool:
+    if not execution_id:
+        return False
+    try:
+        active = has_active_job(
+            gmail_queue,
+            incremental_sync_job_id(execution_id),
+        )
+    except QueueUnavailableError as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Redis is unavailable while checking incremental sync status.",
+        ) from error
+    if active:
+        return False
+    recovery_cutoff = datetime.now(timezone.utc) - timedelta(
+        seconds=INITIAL_SYNC_RECOVERY_TIMEOUT_SECONDS
+    )
+    db: Session = SessionLocal()
+    try:
+        claimed = (
+            db.query(UserAccount)
+            .filter(
+                UserAccount.id == user_id,
+                UserAccount.incremental_sync_id == execution_id,
+                UserAccount.incremental_sync_status == "running",
+                UserAccount.updated_at < recovery_cutoff,
+            )
+            .update(
+                {UserAccount.updated_at: func.now()},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return bool(claimed)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _enqueue_incremental_recovery(
+    user_id: str,
+    email_address: str,
+    execution_id: str,
+) -> None:
+    try:
+        if has_active_job(
+            gmail_queue,
+            incremental_sync_job_id(execution_id),
+        ):
+            return
+        enqueue_job(
+            gmail_queue,
+            run_incremental_recovery_job,
+            user_id,
+            email_address,
+            execution_id,
+            job_id=incremental_sync_job_id(execution_id),
+        )
+    except QueueUnavailableError as error:
+        _mark_incremental_sync_stale(user_id, execution_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Redis is unavailable. Incremental Gmail synchronization was not queued.",
+        ) from error
+
+
+def _mark_incremental_sync_stale(user_id: str, execution_id: str) -> None:
+    db: Session = SessionLocal()
+    try:
+        db.query(UserAccount).filter(
+            UserAccount.id == user_id,
+            UserAccount.incremental_sync_id == execution_id,
+            UserAccount.incremental_sync_status.in_(("pending", "running")),
+        ).update(
+            {
+                UserAccount.incremental_sync_status: "running",
+                UserAccount.updated_at: datetime.now(timezone.utc)
+                - timedelta(seconds=INITIAL_SYNC_RECOVERY_TIMEOUT_SECONDS + 1),
+            },
+            synchronize_session=False,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Could not restore stale incremental sync state for user_id=%s",
+            user_id,
+        )
+        raise
+    finally:
+        db.close()
 
 
 def run_initial_gmail_sync(user_id: str) -> None:
@@ -805,13 +1010,7 @@ def run_initial_gmail_sync(user_id: str) -> None:
             imported_count,
             len(message_ids) - imported_count,
         )
-        try:
-            tag_recent_untagged_emails(user_id)
-        except Exception:
-            logger.exception(
-                "Initial Gmail synchronization tagging failed for user_id=%s",
-                user_id,
-            )
+        _enqueue_recent_email_tagging(user_id)
     except Exception:
         logger.exception("Initial Gmail synchronization failed for user_id=%s", user_id)
         try:
@@ -830,7 +1029,6 @@ def run_initial_gmail_sync(user_id: str) -> None:
     responses={202: {"model": InitialSyncResponse}},
 )
 def sync_initial_emails(
-    background_tasks: BackgroundTasks,
     response: Response,
     authorization: str = Header(...),
     db: Session = Depends(get_db),
@@ -871,7 +1069,7 @@ def sync_initial_emails(
                 history_id = user.last_history_id or ""
                 user.initial_sync_status = "pending"
                 db.close()
-                background_tasks.add_task(run_initial_gmail_sync, user_id)
+                _enqueue_initial_sync(user_id)
                 response.status_code = 202
                 return InitialSyncResponse(
                     status="pending",
@@ -887,13 +1085,13 @@ def sync_initial_emails(
                 getattr(user, "initial_sync_eligible", False)
             )
 
-        if initial_sync_eligible and current_status == "pending":
+        if initial_sync_eligible and current_status in ("pending", "running"):
             reclaimed = _claim_stale_initial_sync(db, user_id)
             db.commit()
             if reclaimed:
                 history_id = user.last_history_id or ""
                 db.close()
-                background_tasks.add_task(run_initial_gmail_sync, user_id)
+                _enqueue_initial_sync(user_id)
                 response.status_code = 202
                 return InitialSyncResponse(
                     status="pending",
@@ -928,15 +1126,6 @@ def sync_initial_emails(
         initial_response_status = (
             "already_completed" if initial_status == "completed" else initial_status
         )
-        watch_user = UserAccount(
-            id=user.id,
-            email=user.email,
-            refresh_token=user.refresh_token,
-            token_expiry=user.token_expiry,
-            last_history_id=user.last_history_id,
-            watch_expiration=user.watch_expiration,
-        )
-        active_token = user.access_token
         email_address = user.email
         stored_email_count = (
             db.query(func.count(Email.id))
@@ -944,59 +1133,98 @@ def sync_initial_emails(
             .scalar()
             or 0
         )
+        if user.incremental_sync_status == "running":
+            execution_id = user.incremental_sync_id
+            if execution_id and _claim_stale_incremental_sync(
+                user_id,
+                execution_id,
+            ):
+                _enqueue_incremental_recovery(
+                    user_id,
+                    email_address,
+                    execution_id,
+                )
+            status_db = SessionLocal()
+            try:
+                incremental_status = (
+                    status_db.query(UserAccount.incremental_sync_status)
+                    .filter(UserAccount.id == user_id)
+                    .scalar()
+                )
+            finally:
+                status_db.close()
+            return InitialSyncResponse(
+                status=initial_response_status,
+                imported_count=0,
+                skipped_count=0,
+                history_id=history_id,
+                account_status="existing",
+                sync_mode="incremental",
+                stored_email_count=stored_email_count,
+                incremental_sync_status=incremental_status or "running",
+            )
+
         db.close()
 
         execution_id = str(uuid.uuid4())
-        if not _claim_incremental_sync(user_id, execution_id):
+        if not _claim_incremental_sync(
+            user_id,
+            execution_id,
+            allow_running=False,
+        ):
+            status_db = SessionLocal()
+            try:
+                incremental_status = (
+                    status_db.query(UserAccount.incremental_sync_status)
+                    .filter(UserAccount.id == user_id)
+                    .scalar()
+                )
+            finally:
+                status_db.close()
+            if incremental_status == "running":
+                return InitialSyncResponse(
+                    status=initial_response_status,
+                    imported_count=0,
+                    skipped_count=0,
+                    history_id=history_id,
+                    account_status="existing",
+                    sync_mode="incremental",
+                    stored_email_count=stored_email_count,
+                    incremental_sync_status="running",
+                )
             raise HTTPException(
                 status_code=404,
                 detail="Gmail account not found.",
             )
         try:
-            watch_res = _register_user_gmail_watch(watch_user, active_token)
-            process_realtime_email_update(
+            enqueue_job(
+                gmail_queue,
+                run_existing_account_catchup_job,
+                user_id,
                 email_address,
-                watch_res["historyId"],
-                True,
                 execution_id,
+                job_id=incremental_sync_job_id(execution_id),
             )
-        except Exception as exc:
+        except QueueUnavailableError as exc:
             try:
-                _set_incremental_sync_status(
-                    user_id,
-                    "failed",
-                    execution_id,
-                )
+                _mark_incremental_sync_stale(user_id, execution_id)
             except Exception:
                 logger.exception(
-                    "Could not record incremental Gmail synchronization failure "
+                    "Could not restore incremental Gmail sync after queue failure "
                     "for user_id=%s",
                     user_id,
                 )
             logger.exception(
-                "Existing Gmail account incremental catch-up failed for user_id=%s",
+                "Existing Gmail account catch-up could not be queued for user_id=%s",
                 user_id,
             )
             raise HTTPException(
                 status_code=503,
-                detail="Existing Gmail account synchronization failed.",
+                detail=(
+                    "Redis is unavailable. Existing Gmail account "
+                    "synchronization was not queued."
+                ),
             ) from exc
-
-        status_db = SessionLocal()
-        try:
-            stored_email_count = (
-                status_db.query(func.count(Email.id))
-                .filter(Email.user_id == user_id)
-                .scalar()
-                or 0
-            )
-            incremental_status = (
-                status_db.query(UserAccount.incremental_sync_status)
-                .filter(UserAccount.id == user_id)
-                .scalar()
-            )
-        finally:
-            status_db.close()
         return InitialSyncResponse(
             status=initial_response_status,
             imported_count=0,
@@ -1005,7 +1233,7 @@ def sync_initial_emails(
             account_status="existing",
             sync_mode="incremental",
             stored_email_count=stored_email_count,
-            incremental_sync_status=incremental_status,
+            incremental_sync_status="running",
         )
     except HTTPException:
         db.rollback()
@@ -1026,7 +1254,6 @@ def sync_initial_emails(
     response_model=InitialSyncStatusResponse,
 )
 def get_initial_sync_status(
-    background_tasks: BackgroundTasks,
     authorization: str = Header(...),
     db: Session = Depends(get_db),
 ):
@@ -1039,11 +1266,30 @@ def get_initial_sync_status(
     initial_sync_status = getattr(user, "initial_sync_status", None)
     if (
         user.initial_sync_eligible
-        and initial_sync_status == "pending"
+        and initial_sync_status in ("pending", "running")
         and _claim_stale_initial_sync(db, user.id)
     ):
         db.commit()
-        background_tasks.add_task(run_initial_gmail_sync, user.id)
+        _enqueue_initial_sync(user.id, recover_stale=True)
+    if (
+        user.incremental_sync_status == "running"
+        and user.incremental_sync_id
+        and _claim_stale_incremental_sync(
+            user.id,
+            user.incremental_sync_id,
+        )
+    ):
+        try:
+            _enqueue_incremental_recovery(
+                user.id,
+                user.email,
+                user.incremental_sync_id,
+            )
+        except HTTPException:
+            logger.exception(
+                "Could not enqueue stale incremental sync recovery for user_id=%s",
+                user.id,
+            )
     status = initial_sync_status or "not_started"
     account_status = (
         "new"
@@ -1068,7 +1314,12 @@ def get_initial_sync_status(
     )
 
 
-def _claim_incremental_sync(user_id: str, execution_id: str) -> bool:
+def _claim_incremental_sync(
+    user_id: str,
+    execution_id: str,
+    *,
+    allow_running: bool = True,
+) -> bool:
     db: Session = SessionLocal()
     try:
         user = (
@@ -1079,8 +1330,12 @@ def _claim_incremental_sync(user_id: str, execution_id: str) -> bool:
         )
         if user is None:
             return False
+        if not allow_running and user.incremental_sync_status == "running":
+            db.rollback()
+            return False
         user.incremental_sync_id = execution_id
         user.incremental_sync_status = "running"
+        user.updated_at = datetime.now(timezone.utc)
         db.commit()
         return True
     except Exception:
@@ -1140,6 +1395,9 @@ def process_realtime_email_update(
             raise RuntimeError(
                 "Gmail account has no saved history cursor; cannot safely process notification."
             )
+        if not force_sync and int(pushed_history_id) <= int(start_id):
+            _set_incremental_sync_status(user_id, "completed", execution_id)
+            return
         token_state = {"access_token": access_token, "expiry": token_expiry}
 
         def persist_refreshed_token(
@@ -1251,10 +1509,10 @@ def process_realtime_email_update(
             latest_id,
         )
         try:
-            tag_recent_untagged_emails(user_id)
+            _enqueue_recent_email_tagging(user_id)
         except Exception:
             logger.exception(
-                "Failed starting background tagging for user_id=%s", user_id
+                "Failed scheduling post-sync email tagging for user_id=%s", user_id
             )
     except Exception:
         if user_id is not None:
@@ -1418,7 +1676,7 @@ def _set_incremental_sync_status(
 
 @router.post("/webhooks/gmail/pubsub")
 def gmail_pubsub_webhook(req: PubSubPushRequest):
-    """Processes a Cloud Pub/Sub push before acknowledging successful ingestion."""
+    """Queue a Gmail notification before acknowledging its Pub/Sub delivery."""
     try:
         raw_data = base64.b64decode(req.message.data, validate=True).decode("utf-8")
         payload = json.loads(raw_data)
@@ -1446,14 +1704,55 @@ def gmail_pubsub_webhook(req: PubSubPushRequest):
             detail="Malformed Gmail notification.",
         ) from exc
 
+    lookup_db: Session = SessionLocal()
     try:
-        process_realtime_email_update(email_address, str(history_id))
-    except Exception as exc:
-        logger.exception("Failed processing Gmail Pub/Sub notification")
+        user = (
+            lookup_db.query(UserAccount)
+            .filter(func.lower(UserAccount.email) == email_address.lower())
+            .first()
+        )
+        if user is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Gmail account is not available; retry the notification.",
+            )
+        user_id = user.id
+        last_history_id = user.last_history_id
+    finally:
+        lookup_db.close()
+
+    if last_history_id and int(history_id) <= int(last_history_id):
+        return Response(status_code=204)
+
+    execution_id = pubsub_execution_id(email_address, str(history_id))
+    if not _claim_incremental_sync(user_id, execution_id):
         raise HTTPException(
             status_code=503,
-            detail="Gmail notification processing failed; retry the delivery.",
-        ) from exc
+            detail="Gmail account is not available; retry the notification.",
+        )
+
+    try:
+        enqueue_job(
+            gmail_queue,
+            run_pubsub_gmail_sync_job,
+            email_address,
+            str(history_id),
+            execution_id,
+            job_id=incremental_sync_job_id(execution_id),
+        )
+    except QueueUnavailableError as error:
+        try:
+            _set_incremental_sync_status(user_id, "failed", execution_id)
+        except Exception:
+            logger.exception(
+                "Could not record Pub/Sub queue failure for user_id=%s",
+                user_id,
+            )
+        logger.exception("Failed to enqueue Gmail Pub/Sub notification")
+        raise HTTPException(
+            status_code=503,
+            detail="Gmail synchronization queue is unavailable; retry the delivery.",
+        ) from error
 
     return Response(status_code=204)
 
