@@ -1,11 +1,12 @@
 import os
 import unittest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
 from app.api.routes import google_auth
 from app.db.database import get_db
@@ -16,9 +17,11 @@ class FakeDatabase:
     def __init__(self):
         self.statement = None
         self.committed = False
+        self.rolled_back = False
+        self.query_failure = None
 
     def query(self, *_models):
-        return FakeQuery()
+        return FakeQuery(self.query_failure)
 
     def execute(self, statement):
         self.statement = statement
@@ -26,12 +29,20 @@ class FakeDatabase:
     def commit(self):
         self.committed = True
 
+    def rollback(self):
+        self.rolled_back = True
+
 
 class FakeQuery:
+    def __init__(self, failure=None):
+        self.failure = failure
+
     def filter(self, *_conditions):
         return self
 
     def first(self):
+        if self.failure:
+            raise self.failure
         return None
 
 
@@ -229,3 +240,78 @@ class GoogleTokenSyncTests(unittest.TestCase):
         self.assertNotIn("access-token", "\n".join(captured.output))
         self.assertIn("database persistence", "\n".join(captured.output))
         self.assertIn("SQLAlchemyError", "\n".join(captured.output))
+        self.assertIn("stage=commit", "\n".join(captured.output))
+        self.assertTrue(self.database.rolled_back)
+
+    def test_existing_account_select_failure_is_logged_and_rolled_back(self):
+        profile_service = MagicMock()
+        profile_service.users.return_value.getProfile.return_value.execute.return_value = {
+            "emailAddress": "person@example.com"
+        }
+        self.database.query_failure = SQLAlchemyError(
+            "database failure included access-token"
+        )
+
+        with (
+            patch.dict(os.environ, {"GOOGLE_TOKEN_SYNC_SECRET": "sync-secret"}),
+            patch.object(
+                google_auth,
+                "get_gmail_service_from_token",
+                return_value=(profile_service, "access-token"),
+            ),
+            self.assertLogs(google_auth.logger, level="ERROR") as captured,
+        ):
+            response = self.client.put(
+                "/api/v1/auth/google-tokens",
+                headers={"X-Google-Token-Sync-Secret": "sync-secret"},
+                json={
+                    "email": "person@example.com",
+                    "access_token": "access-token",
+                },
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertNotIn("access-token", response.text)
+        self.assertNotIn("access-token", "\n".join(captured.output))
+        self.assertIn("stage=existing_account_select", "\n".join(captured.output))
+        self.assertTrue(self.database.rolled_back)
+        self.assertFalse(self.database.committed)
+
+    def test_database_failure_logs_postgres_diagnostics(self):
+        profile_service = MagicMock()
+        profile_service.users.return_value.getProfile.return_value.execute.return_value = {
+            "emailAddress": "person@example.com"
+        }
+        original_error = Exception("duplicate key")
+        original_error.sqlstate = "23505"
+        original_error.diag = SimpleNamespace(
+            constraint_name="user_accounts_pkey"
+        )
+        self.database.execute = MagicMock(
+            side_effect=DBAPIError(None, None, original_error)
+        )
+
+        with (
+            patch.dict(os.environ, {"GOOGLE_TOKEN_SYNC_SECRET": "sync-secret"}),
+            patch.object(
+                google_auth,
+                "get_gmail_service_from_token",
+                return_value=(profile_service, "access-token"),
+            ),
+            self.assertLogs(google_auth.logger, level="ERROR") as captured,
+        ):
+            response = self.client.put(
+                "/api/v1/auth/google-tokens",
+                headers={"X-Google-Token-Sync-Secret": "sync-secret"},
+                json={
+                    "email": "person@example.com",
+                    "access_token": "access-token",
+                },
+            )
+
+        log_output = "\n".join(captured.output)
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("stage=token_upsert_execute", log_output)
+        self.assertIn("sqlstate=23505", log_output)
+        self.assertIn("constraint=user_accounts_pkey", log_output)
+        self.assertTrue(self.database.rolled_back)

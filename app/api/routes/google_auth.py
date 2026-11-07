@@ -21,6 +21,29 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
 
 
+def _log_database_failure(stage: str, error: SQLAlchemyError) -> None:
+    original_error = getattr(error, "orig", None)
+    diagnostic = getattr(original_error, "diag", None)
+    sqlstate = getattr(original_error, "sqlstate", None) or getattr(
+        original_error, "pgcode", None
+    )
+    constraint_name = getattr(diagnostic, "constraint_name", None)
+    exception_type = (
+        type(original_error).__name__
+        if original_error is not None
+        else type(error).__name__
+    )
+    logger.error(
+        "Google token sync database persistence failure stage=%s exception_type=%s "
+        "sqlalchemy_exception_type=%s sqlstate=%s constraint=%s",
+        stage,
+        exception_type,
+        type(error).__name__,
+        sqlstate,
+        constraint_name,
+    )
+
+
 @router.put("/google-tokens")
 def sync_google_tokens(
     request: GoogleTokenSyncRequest,
@@ -106,81 +129,85 @@ def sync_google_tokens(
         refresh_token = refresh_token if refresh_token.strip() else None
 
     persistence_started = perf_counter()
-    existing_account = (
-        db.query(UserAccount)
-        .filter(func.lower(UserAccount.email) == verified_email.lower())
-        .first()
-    )
-    previous_access_token = (
-        existing_account.access_token if existing_account is not None else None
-    )
-    statement = postgresql_insert(UserAccount).values(
-        id=verified_email.lower(),
-        email=verified_email,
-        access_token=request.access_token,
-        refresh_token=refresh_token,
-        token_expiry=request.access_token_expires_at,
-        initial_sync_status="not_started",
-        initial_sync_eligible=True,
-    )
-    incoming_token_is_current = or_(
-        UserAccount.token_expiry.is_(None),
-        and_(
-            statement.excluded.token_expiry.is_not(None),
-            statement.excluded.token_expiry >= UserAccount.token_expiry,
-        ),
-    )
-    statement = statement.on_conflict_do_update(
-        index_elements=[UserAccount.email],
-        set_={
-            UserAccount.access_token: case(
-                (incoming_token_is_current, statement.excluded.access_token),
-                else_=UserAccount.access_token,
-            ),
-            UserAccount.token_expiry: case(
-                (
-                    incoming_token_is_current,
-                    func.coalesce(
-                        statement.excluded.token_expiry,
-                        UserAccount.token_expiry,
-                    ),
-                ),
-                else_=UserAccount.token_expiry,
-            ),
-            UserAccount.refresh_token: case(
-                (
-                    incoming_token_is_current,
-                    func.coalesce(
-                        func.nullif(statement.excluded.refresh_token, ""),
-                        UserAccount.refresh_token,
-                    ),
-                ),
-                else_=UserAccount.refresh_token,
-            ),
-            UserAccount.updated_at: func.now(),
-        },
-        where=incoming_token_is_current,
-    )
+    database_stage = "existing_account_select"
     try:
+        existing_account = (
+            db.query(UserAccount)
+            .filter(func.lower(UserAccount.email) == verified_email.lower())
+            .first()
+        )
+        previous_access_token = (
+            existing_account.access_token if existing_account is not None else None
+        )
+        statement = postgresql_insert(UserAccount).values(
+            id=verified_email.lower(),
+            email=verified_email,
+            access_token=request.access_token,
+            refresh_token=refresh_token,
+            token_expiry=request.access_token_expires_at,
+            initial_sync_status="not_started",
+            initial_sync_eligible=True,
+        )
+        incoming_token_is_current = or_(
+            UserAccount.token_expiry.is_(None),
+            and_(
+                statement.excluded.token_expiry.is_not(None),
+                statement.excluded.token_expiry >= UserAccount.token_expiry,
+            ),
+        )
+        statement = statement.on_conflict_do_update(
+            index_elements=[UserAccount.email],
+            set_={
+                UserAccount.access_token: case(
+                    (incoming_token_is_current, statement.excluded.access_token),
+                    else_=UserAccount.access_token,
+                ),
+                UserAccount.token_expiry: case(
+                    (
+                        incoming_token_is_current,
+                        func.coalesce(
+                            statement.excluded.token_expiry,
+                            UserAccount.token_expiry,
+                        ),
+                    ),
+                    else_=UserAccount.token_expiry,
+                ),
+                UserAccount.refresh_token: case(
+                    (
+                        incoming_token_is_current,
+                        func.coalesce(
+                            func.nullif(statement.excluded.refresh_token, ""),
+                            UserAccount.refresh_token,
+                        ),
+                    ),
+                    else_=UserAccount.refresh_token,
+                ),
+                UserAccount.updated_at: func.now(),
+            },
+            where=incoming_token_is_current,
+        )
+        database_stage = "token_upsert_execute"
         db.execute(statement)
+        database_stage = "commit"
         db.commit()
-        invalidate_google_profile_verification(previous_access_token)
-        invalidate_google_profile_verification(request.access_token)
-        logger.info(
-            "google_token_sync_timing credential_setup_ms=%.1f "
-            "google_profile_ms=%.1f "
-            "database_persist_ms=%.1f",
-            credential_setup_ms,
-            profile_ms,
-            (perf_counter() - persistence_started) * 1000,
-        )
     except SQLAlchemyError as error:
-        logger.error(
-            "Google token sync failed during database persistence (error_type=%s)",
-            type(error).__name__,
-        )
+        _log_database_failure(database_stage, error)
+        try:
+            db.rollback()
+        except SQLAlchemyError as rollback_error:
+            _log_database_failure("rollback", rollback_error)
         raise HTTPException(
             status_code=500,
             detail="Unable to persist Google account tokens.",
         ) from None
+    invalidate_google_profile_verification(previous_access_token)
+    invalidate_google_profile_verification(request.access_token)
+    logger.info(
+        "google_token_sync_timing credential_setup_ms=%.1f "
+        "google_profile_ms=%.1f "
+        "database_persist_ms=%.1f",
+        credential_setup_ms,
+        profile_ms,
+        (perf_counter() - persistence_started) * 1000,
+    )
     return {"status": "synced"}

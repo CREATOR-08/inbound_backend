@@ -63,10 +63,10 @@ async def log_email_endpoint_timing(request, call_next):
         )
 
 frontend_origins = [
-    origin.strip()
+    origin.strip().rstrip("/")
     for origin in os.getenv(
         "FRONTEND_ORIGINS",
-        "https://inbound-opal.vercel.app/",
+        "https://inbound-opal.vercel.app",
     ).split(",")
     if origin.strip()
 ]
@@ -75,8 +75,18 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=frontend_origins,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+    ],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+    ],
 )
 
 # Register routes

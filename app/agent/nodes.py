@@ -82,7 +82,7 @@ def triage_node(state: EmailAgentState) -> dict:
 # def drafter_node(state: EmailAgentState) -> dict:
 #     prompt = ChatPromptTemplate.from_messages([
 #         (
-#             "system",
+#             "system",he 10 variables from your screenshot are present and non-
 #             "You are a email assistant. "
 #             "Draft a email response for the email received in a positive manner ",
 #         ),
