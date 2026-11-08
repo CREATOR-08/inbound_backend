@@ -264,6 +264,34 @@ class GmailCredentialTests(unittest.TestCase):
             ("gmail-service", "refreshed-access-token", expiry),
         )
 
+    def test_force_refresh_refreshes_nonexpired_credentials(self):
+        expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+        credentials = MagicMock()
+        credentials.expired = False
+        credentials.token = "refreshed-access-token"
+        credentials.refresh_token = "refresh-token"
+        credentials.expiry = expiry
+
+        with (
+            patch.object(gmail, "Credentials", return_value=credentials),
+            patch.object(gmail, "Request", return_value="google-auth-request"),
+            patch.object(gmail, "build", return_value="gmail-service"),
+            patch.object(gmail, "GOOGLE_CLIENT_ID", "client-id"),
+            patch.object(gmail, "GOOGLE_CLIENT_SECRET", "client-secret"),
+        ):
+            result = gmail.get_gmail_service_with_token_state(
+                "old-access-token",
+                "refresh-token",
+                expiry,
+                force_refresh=True,
+            )
+
+        credentials.refresh.assert_called_once_with("google-auth-request")
+        self.assertEqual(
+            result,
+            ("gmail-service", "refreshed-access-token", expiry),
+        )
+
     def test_expired_credentials_without_refresh_token_require_reauthorization(self):
         credentials = MagicMock()
         credentials.expired = True

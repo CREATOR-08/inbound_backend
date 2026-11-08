@@ -1773,69 +1773,110 @@ def _set_incremental_sync_status(
         db.close()
 
 
+
 @router.post("/webhooks/gmail/pubsub")
 def gmail_pubsub_webhook(req: PubSubPushRequest):
     """Queue a Gmail notification before acknowledging its Pub/Sub delivery."""
+
+    # 1. Decode and validate Pub/Sub notification.
     try:
-        raw_data = base64.b64decode(req.message.data, validate=True).decode("utf-8")
+        raw_data = base64.b64decode(
+            req.message.data,
+            validate=True,
+        ).decode("utf-8")
+
         payload = json.loads(raw_data)
+
         if not isinstance(payload, dict):
             raise ValueError("Pub/Sub payload must be a JSON object")
 
         email_address = payload.get("emailAddress")
         history_id = payload.get("historyId")
+
         if not isinstance(email_address, str) or not email_address.strip():
             raise ValueError("Pub/Sub payload is missing emailAddress")
+
+        # Normalize once and use consistently.
+        normalized_email = email_address.strip().casefold()
+
         if isinstance(history_id, bool) or not (
             isinstance(history_id, int)
-            or isinstance(history_id, str)
-            and history_id.isdigit()
+            or isinstance(history_id, str) and history_id.isdigit()
         ):
             raise ValueError("Pub/Sub payload has an invalid historyId")
+
+        logger.info(
+            "PUBSUB_NOTIFICATION_RECEIVED email=%r history_id=%s",
+            normalized_email,
+            history_id,
+        )
+
     except (
         binascii.Error,
         UnicodeDecodeError,
         ValueError,
+        json.JSONDecodeError,
     ) as exc:
-        logger.warning("Malformed Pub/Sub message received")
+        logger.warning(
+            "Malformed Pub/Sub message received: %s",
+            type(exc).__name__,
+        )
         raise HTTPException(
             status_code=400,
             detail="Malformed Gmail notification.",
         ) from exc
 
-    logger.info(
-        "PUBSUB_NOTIFICATION_RECEIVED history_id=%s",
-        history_id,
-    )
+    # 2. Find the Gmail account.
     lookup_db: Session = SessionLocal()
+
     try:
+        logger.info(
+            "PUBSUB_ACCOUNT_LOOKUP_DEBUG notification_email=%r normalized_email=%r",
+            email_address,
+            normalized_email,
+        )
+
         user = (
             lookup_db.query(UserAccount)
-            .filter(func.lower(UserAccount.email) == email_address.lower())
+            .filter(
+                func.lower(func.trim(UserAccount.email)) == normalized_email
+            )
             .first()
         )
+
+        if user is None:
+            logger.warning(
+                "REALTIME_SYNC_FAILED stage=pubsub_account_lookup "
+                "exception_type=AccountNotFound email=%r",
+                normalized_email,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Gmail account is not available; retry the notification.",
+            )
+
+        # Copy required values before closing the session.
+        user_id = user.id
+        last_history_id = user.last_history_id
+
+    except HTTPException:
+        raise
+
     except Exception as error:
-        logger.error(
+        logger.exception(
             "REALTIME_SYNC_FAILED stage=pubsub_account_lookup "
             "exception_type=%s",
             type(error).__name__,
         )
-        raise
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to look up Gmail account; retry the notification.",
+        ) from error
+
     finally:
         lookup_db.close()
 
-    if user is None:
-        logger.warning(
-            "REALTIME_SYNC_FAILED stage=pubsub_account_lookup "
-            "exception_type=AccountNotFound"
-        )
-        raise HTTPException(
-            status_code=503,
-            detail="Gmail account is not available; retry the notification.",
-        )
-    user_id = user.id
-    last_history_id = user.last_history_id
-
+    # 3. Skip notifications already processed.
     if last_history_id and int(history_id) <= int(last_history_id):
         logger.info(
             "PUBSUB_NOTIFICATION_ACKNOWLEDGED history_id=%s reason=already_processed",
@@ -1843,65 +1884,90 @@ def gmail_pubsub_webhook(req: PubSubPushRequest):
         )
         return Response(status_code=204)
 
-    execution_id = pubsub_execution_id(email_address, str(history_id))
+    # 4. Generate deterministic execution ID.
+    execution_id = pubsub_execution_id(
+        normalized_email,
+        str(history_id),
+    )
+
+    # 5. Claim incremental sync execution.
     try:
         claimed = _claim_incremental_sync(user_id, execution_id)
+
     except Exception as error:
-        logger.error(
-            "REALTIME_SYNC_FAILED stage=incremental_sync_claim user_id=%s "
-            "execution_id=%s exception_type=%s",
+        logger.exception(
+            "REALTIME_SYNC_FAILED stage=incremental_sync_claim "
+            "user_id=%s execution_id=%s exception_type=%s",
             user_id,
             execution_id,
             type(error).__name__,
         )
-        raise
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to claim Gmail synchronization; retry the notification.",
+        ) from error
+
     if not claimed:
         logger.warning(
-            "REALTIME_SYNC_FAILED stage=incremental_sync_claim user_id=%s "
-            "execution_id=%s exception_type=SyncAlreadyClaimed",
+            "REALTIME_SYNC_FAILED stage=incremental_sync_claim "
+            "user_id=%s execution_id=%s exception_type=SyncAlreadyClaimed",
             user_id,
             execution_id,
         )
         raise HTTPException(
             status_code=503,
-            detail="Gmail account is not available; retry the notification.",
+            detail="Gmail synchronization is already claimed; retry the notification.",
         )
 
+    # 6. Enqueue background Gmail synchronization.
     try:
-        enqueue_job(
+        job = enqueue_job(
             gmail_queue,
             run_pubsub_gmail_sync_job,
-            email_address,
+            normalized_email,
             str(history_id),
             execution_id,
             job_id=incremental_sync_job_id(execution_id),
         )
+
+        logger.info(
+            "PUBSUB_NOTIFICATION_ENQUEUED "
+            "user_id=%s execution_id=%s history_id=%s job_id=%s",
+            user_id,
+            execution_id,
+            history_id,
+            job.id,
+        )
+
     except QueueUnavailableError as error:
         try:
-            _set_incremental_sync_status(user_id, "failed", execution_id)
+            _set_incremental_sync_status(
+                user_id,
+                "failed",
+                execution_id,
+            )
         except Exception:
             logger.exception(
-                "Could not record Pub/Sub queue failure for user_id=%s",
+                "Could not record Pub/Sub queue failure "
+                "for user_id=%s execution_id=%s",
                 user_id,
+                execution_id,
             )
-        logger.error(
-            "REALTIME_SYNC_FAILED stage=queue_enqueue user_id=%s "
-            "execution_id=%s exception_type=%s",
+
+        logger.exception(
+            "REALTIME_SYNC_FAILED stage=queue_enqueue "
+            "user_id=%s execution_id=%s exception_type=%s",
             user_id,
             execution_id,
             type(error).__name__,
         )
+
         raise HTTPException(
             status_code=503,
             detail="Gmail synchronization queue is unavailable; retry the delivery.",
         ) from error
 
-    logger.info(
-        "PUBSUB_NOTIFICATION_ENQUEUED user_id=%s execution_id=%s history_id=%s",
-        user_id,
-        execution_id,
-        history_id,
-    )
+    # 7. Acknowledge only after successful enqueue.
     return Response(status_code=204)
 
 

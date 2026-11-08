@@ -56,6 +56,7 @@ def get_gmail_service_with_token_state(
     refresh_token: Optional[str] = None,
     token_expiry: Optional[datetime] = None,
     *,
+    force_refresh: bool = False,
     refresh_if_expiry_missing: bool = False,
     on_token_refresh: Optional[TokenRefreshCallback] = None,
 ) -> Tuple[Any, str, Optional[datetime]]:
@@ -75,7 +76,7 @@ def get_gmail_service_with_token_state(
         expiry=credentials_expiry,
     )
 
-    should_refresh = credentials.expired or (
+    should_refresh = force_refresh or credentials.expired or (
         refresh_if_expiry_missing and token_expiry is None
     )
     if should_refresh:

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session, aliased
 from app.api.schemas.assistant import EmailFilter, EmailQuerySpec
 from app.db.database import SessionLocal
 from app.db.models import Email, EmailAgentStateModel
+from app.services.gmail import html_to_text
 
 SessionFactory = Callable[[], Session]
 
@@ -134,9 +135,16 @@ def get_email_for_user(
         if row is None:
             return None
         email, state = row
+        plain_body = email.body.strip() if isinstance(email.body, str) else ""
+        html_body = html_to_text(email.body_html or "") if not plain_body else ""
+        body = plain_body or html_body
+        body_available = bool(body)
+        if not body:
+            body = email.preview or ""
         return {
             **_email_payload(email, state),
-            "body": (email.body or email.preview or "")[:12_000],
+            "body": body[:12_000],
+            "body_available": body_available,
         }
     finally:
         db.close()

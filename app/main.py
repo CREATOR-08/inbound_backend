@@ -62,15 +62,22 @@ async def log_email_endpoint_timing(request, call_next):
             request_id,
         )
 
+# frontend_origins = [
+#     origin.strip().rstrip("/")
+#     for origin in os.getenv(
+#         "FRONTEND_ORIGINS",
+#         "https://inbound-opal.vercel.app,http://localhost:3000",
+#     ).split(",")
+#     if origin.strip()
+# ]
 frontend_origins = [
     origin.strip().rstrip("/")
     for origin in os.getenv(
         "FRONTEND_ORIGINS",
-        "https://inbound-opal.vercel.app",
+        "http://localhost:3000",
     ).split(",")
     if origin.strip()
 ]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=frontend_origins,

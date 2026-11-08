@@ -1,3 +1,5 @@
+
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -7,6 +9,8 @@ from rq.exceptions import DuplicateJobError
 from rq.job import JobStatus
 
 from app.core.redis import redis_connection
+
+logger = logging.getLogger(__name__)
 
 gmail_queue = Queue(
     "gmail",
@@ -31,6 +35,7 @@ default_queue = Queue(
 )
 
 JOB_RETRY = Retry(max=2, interval=[15, 60])
+
 ACTIVE_JOB_STATUSES = {
     JobStatus.QUEUED,
     JobStatus.STARTED,
@@ -43,6 +48,18 @@ class QueueUnavailableError(RuntimeError):
     """Raised when a job cannot be persisted to Redis."""
 
 
+def _raise_queue_unavailable(error: RedisError) -> None:
+    logger.exception(
+        "REDIS_QUEUE_OPERATION_FAILED error_type=%s error=%r",
+        type(error).__name__,
+        error,
+    )
+
+    raise QueueUnavailableError(
+        "Redis queue operation failed. Check REDIS_URL and Redis availability."
+    ) from error
+
+
 def enqueue_job(
     queue: Queue,
     function: Callable[..., Any],
@@ -51,36 +68,43 @@ def enqueue_job(
     **kwargs: Any,
 ) -> Any:
     kwargs.setdefault("retry", JOB_RETRY)
+
     if job_id is not None:
         kwargs["job_id"] = job_id
         kwargs["unique"] = True
+
     try:
         return queue.enqueue(function, *args, **kwargs)
+
     except DuplicateJobError:
         if job_id is None:
             raise
+
         try:
             existing = queue.fetch_job(job_id)
-            if existing is not None and existing.get_status() in ACTIVE_JOB_STATUSES:
+
+            if (
+                existing is not None
+                and existing.get_status() in ACTIVE_JOB_STATUSES
+            ):
                 return existing
+
             if existing is not None:
                 existing.delete()
+
             return queue.enqueue(function, *args, **kwargs)
+
         except RedisError as error:
-            raise QueueUnavailableError(
-                "Redis is unavailable. Check REDIS_URL and confirm the Redis server is running."
-            ) from error
+            _raise_queue_unavailable(error)
+
     except RedisError as error:
-        raise QueueUnavailableError(
-            "Redis is unavailable. Check REDIS_URL and confirm the Redis server is running."
-        ) from error
+        _raise_queue_unavailable(error)
 
 
 def has_active_job(queue: Queue, job_id: str) -> bool:
     try:
         job = queue.fetch_job(job_id)
         return job is not None and job.get_status() in ACTIVE_JOB_STATUSES
+
     except RedisError as error:
-        raise QueueUnavailableError(
-            "Redis is unavailable. Check REDIS_URL and confirm the Redis server is running."
-        ) from error
+        _raise_queue_unavailable(error)

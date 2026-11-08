@@ -76,6 +76,11 @@ class GoogleTokenSyncTests(unittest.TestCase):
                 "get_gmail_service_from_token",
                 return_value=(profile_service, "access-token"),
             ) as gmail_service,
+            patch.object(
+                google_auth,
+                "get_gmail_service_with_token_state",
+                return_value=(profile_service, "access-token", None),
+            ) as refresh_service,
         ):
             response = self.client.put(
                 "/api/v1/auth/google-tokens",
@@ -92,6 +97,11 @@ class GoogleTokenSyncTests(unittest.TestCase):
         self.assertEqual(response.json(), {"status": "synced"})
         self.assertNotIn("refresh-token", response.text)
         gmail_service.assert_called_once_with("access-token")
+        refresh_service.assert_called_once_with(
+            "access-token",
+            "refresh-token",
+            force_refresh=True,
+        )
         self.assertTrue(self.database.committed)
 
         compiled = self.database.statement.compile(dialect=postgresql.dialect())
@@ -153,6 +163,161 @@ class GoogleTokenSyncTests(unittest.TestCase):
                     self.assertIsNone(compiled.params["refresh_token"])
                     self.assertIn("coalesce", str(compiled).lower())
                     self.assertIn("nullif", str(compiled).lower())
+
+    def test_accepts_matching_access_and_refresh_token_identities(self):
+        access_service = MagicMock()
+        access_service.users.return_value.getProfile.return_value.execute.return_value = {
+            "emailAddress": "Person@example.com"
+        }
+        refresh_service = MagicMock()
+        refresh_service.users.return_value.getProfile.return_value.execute.return_value = {
+            "emailAddress": "person@example.com"
+        }
+
+        with (
+            patch.dict(os.environ, {"GOOGLE_TOKEN_SYNC_SECRET": "sync-secret"}),
+            patch.object(
+                google_auth,
+                "get_gmail_service_from_token",
+                return_value=(access_service, "access-token"),
+            ),
+            patch.object(
+                google_auth,
+                "get_gmail_service_with_token_state",
+                return_value=(refresh_service, "refreshed-access-token", None),
+            ) as refresh_credentials,
+        ):
+            response = self.client.put(
+                "/api/v1/auth/google-tokens",
+                headers={"X-Google-Token-Sync-Secret": "sync-secret"},
+                json={
+                    "email": "person@example.com",
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self.database.committed)
+        refresh_credentials.assert_called_once_with(
+            "access-token",
+            "refresh-token",
+            force_refresh=True,
+        )
+
+    def test_rejects_mismatched_refresh_token_identity_without_persisting(self):
+        access_service = MagicMock()
+        access_service.users.return_value.getProfile.return_value.execute.return_value = {
+            "emailAddress": "person@example.com"
+        }
+        refresh_service = MagicMock()
+        refresh_service.users.return_value.getProfile.return_value.execute.return_value = {
+            "emailAddress": "other@example.com"
+        }
+
+        with (
+            patch.dict(os.environ, {"GOOGLE_TOKEN_SYNC_SECRET": "sync-secret"}),
+            patch.object(
+                google_auth,
+                "get_gmail_service_from_token",
+                return_value=(access_service, "access-token"),
+            ),
+            patch.object(
+                google_auth,
+                "get_gmail_service_with_token_state",
+                return_value=(refresh_service, "refreshed-access-token", None),
+            ),
+            self.assertLogs(google_auth.logger, level="WARNING") as captured,
+        ):
+            response = self.client.put(
+                "/api/v1/auth/google-tokens",
+                headers={"X-Google-Token-Sync-Secret": "sync-secret"},
+                json={
+                    "email": "person@example.com",
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                },
+            )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(self.database.committed)
+        self.assertIsNone(self.database.statement)
+        self.assertIn("access_email=person@example.com", captured.output[0])
+        self.assertIn("refresh_email=other@example.com", captured.output[0])
+        self.assertNotIn("access-token", "\n".join(captured.output))
+        self.assertNotIn("refresh-token", "\n".join(captured.output))
+
+    def test_refresh_failure_does_not_persist_credentials_or_log_tokens(self):
+        from app.services.gmail import GmailReauthorizationRequired
+
+        access_service = MagicMock()
+        access_service.users.return_value.getProfile.return_value.execute.return_value = {
+            "emailAddress": "person@example.com"
+        }
+
+        with (
+            patch.dict(os.environ, {"GOOGLE_TOKEN_SYNC_SECRET": "sync-secret"}),
+            patch.object(
+                google_auth,
+                "get_gmail_service_from_token",
+                return_value=(access_service, "access-token"),
+            ),
+            patch.object(
+                google_auth,
+                "get_gmail_service_with_token_state",
+                side_effect=GmailReauthorizationRequired("refresh failed"),
+            ),
+            self.assertLogs(google_auth.logger, level="WARNING") as captured,
+        ):
+            response = self.client.put(
+                "/api/v1/auth/google-tokens",
+                headers={"X-Google-Token-Sync-Secret": "sync-secret"},
+                json={
+                    "email": "person@example.com",
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                },
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertFalse(self.database.committed)
+        self.assertIsNone(self.database.statement)
+        log_output = "\n".join(captured.output)
+        self.assertIn("stage=refresh_token_identity_validation", log_output)
+        self.assertIn("person@example.com", log_output)
+        self.assertNotIn("access-token", log_output)
+        self.assertNotIn("refresh-token", log_output)
+
+    def test_missing_refresh_token_skips_refresh_identity_check(self):
+        profile_service = MagicMock()
+        profile_service.users.return_value.getProfile.return_value.execute.return_value = {
+            "emailAddress": "person@example.com"
+        }
+
+        with (
+            patch.dict(os.environ, {"GOOGLE_TOKEN_SYNC_SECRET": "sync-secret"}),
+            patch.object(
+                google_auth,
+                "get_gmail_service_from_token",
+                return_value=(profile_service, "access-token"),
+            ),
+            patch.object(
+                google_auth,
+                "get_gmail_service_with_token_state",
+            ) as refresh_credentials,
+        ):
+            response = self.client.put(
+                "/api/v1/auth/google-tokens",
+                headers={"X-Google-Token-Sync-Secret": "sync-secret"},
+                json={
+                    "email": "person@example.com",
+                    "access_token": "access-token",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self.database.committed)
+        refresh_credentials.assert_not_called()
 
     def test_rejects_token_sync_if_google_email_does_not_match(self):
         profile_service = MagicMock()

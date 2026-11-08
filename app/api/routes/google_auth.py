@@ -15,7 +15,11 @@ from app.api.google_profile_cache import invalidate_google_profile_verification
 from app.api.schemas.schemas import GoogleTokenSyncRequest
 from app.db.database import get_db
 from app.db.models import UserAccount
-from app.services.gmail import get_gmail_service_from_token
+from app.services.gmail import (
+    GmailReauthorizationRequired,
+    get_gmail_service_from_token,
+    get_gmail_service_with_token_state,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
@@ -127,6 +131,61 @@ def sync_google_tokens(
     refresh_token = request.refresh_token
     if isinstance(refresh_token, str):
         refresh_token = refresh_token if refresh_token.strip() else None
+
+    if refresh_token:
+        try:
+            refresh_service, _, _ = get_gmail_service_with_token_state(
+                request.access_token,
+                refresh_token,
+                force_refresh=True,
+            )
+            refresh_profile = (
+                refresh_service.users().getProfile(userId="me").execute()
+            )
+        except (GmailReauthorizationRequired, GoogleAuthError) as error:
+            logger.warning(
+                "Google token sync failed stage=refresh_token_identity_validation "
+                "email=%s exception_type=%s",
+                verified_email,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=401,
+                detail="Google account access must be reauthorized.",
+            ) from error
+        except HttpError as error:
+            status = getattr(getattr(error, "resp", None), "status", None)
+            logger.warning(
+                "Google token sync failed stage=refresh_token_identity_validation "
+                "email=%s http_status=%s",
+                verified_email,
+                status,
+            )
+            raise HTTPException(
+                status_code=401 if status in (401, 403) else 502,
+                detail=(
+                    "Google Gmail access must be reauthorized."
+                    if status in (401, 403)
+                    else "Unable to verify the Google account."
+                ),
+            ) from error
+
+        refresh_email = refresh_profile.get("emailAddress")
+        if (
+            not isinstance(refresh_email, str)
+            or refresh_email.strip().casefold()
+            != verified_email.strip().casefold()
+        ):
+            logger.warning(
+                "Google token sync rejected stage=refresh_token_identity_validation "
+                "access_email=%s refresh_email=%s",
+                verified_email,
+                refresh_email if isinstance(refresh_email, str) else "<missing>",
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="Google account credentials do not match.",
+            )
 
     persistence_started = perf_counter()
     database_stage = "existing_account_select"
