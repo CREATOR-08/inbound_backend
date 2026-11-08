@@ -40,3 +40,5 @@ plan.txt
 reset.*
 terminal.txt
 README (1).md
+.vercel
+.env*
