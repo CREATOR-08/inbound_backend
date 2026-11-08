@@ -1355,42 +1355,57 @@ def process_realtime_email_update(
     user_id = None
     owns_preclaimed_execution = execution_id is not None
     execution_id = execution_id or str(uuid.uuid4())
-    db: Session = SessionLocal()
+    stage = "account_lookup"
     try:
-        user_data = (
-            db.query(UserAccount)
-            .filter(func.lower(UserAccount.email) == email_address.lower())
-            .with_for_update()
-            .first()
-        )
-        if not user_data or not user_data.access_token:
-            logger.warning("No credentials found for incoming user %s", email_address)
-            raise GmailReauthorizationRequired(
-                "Reconnect your Google account to restore Gmail synchronization."
+        db: Session = SessionLocal()
+        try:
+            user_data = (
+                db.query(UserAccount)
+                .filter(func.lower(UserAccount.email) == email_address.lower())
+                .with_for_update()
+                .first()
             )
+            if not user_data or not user_data.access_token:
+                logger.warning(
+                    "No credentials found for incoming user %s", email_address
+                )
+                raise GmailReauthorizationRequired(
+                    "Reconnect your Google account to restore Gmail synchronization."
+                )
 
-        user_id = user_data.id
-        access_token = user_data.access_token
-        refresh_token = user_data.refresh_token
-        token_expiry = user_data.token_expiry
-        start_id = user_data.last_history_id
-        if (
-            execution_id
-            and getattr(user_data, "incremental_sync_id", None) == execution_id
-        ):
-            pass
-        elif owns_preclaimed_execution:
-            return
-        elif not force_sync and start_id and int(pushed_history_id) <= int(start_id):
-            return
-        else:
-            user_data.incremental_sync_id = execution_id
-            user_data.incremental_sync_status = "running"
-            db.commit()
-    finally:
-        db.close()
+            user_id = user_data.id
+            access_token = user_data.access_token
+            refresh_token = user_data.refresh_token
+            token_expiry = user_data.token_expiry
+            start_id = user_data.last_history_id
+            if (
+                execution_id
+                and getattr(user_data, "incremental_sync_id", None) == execution_id
+            ):
+                pass
+            elif owns_preclaimed_execution:
+                return
+            elif (
+                not force_sync
+                and start_id
+                and int(pushed_history_id) <= int(start_id)
+            ):
+                return
+            else:
+                user_data.incremental_sync_id = execution_id
+                user_data.incremental_sync_status = "running"
+                db.commit()
+        finally:
+            db.close()
 
-    try:
+        logger.info(
+            "REALTIME_SYNC_STARTED user_id=%s execution_id=%s "
+            "start_history_id=%s pushed_history_id=%s",
+            user_id,
+            execution_id,
+            start_id,
+            pushed_history_id,
+        )
         if not start_id:
             raise RuntimeError(
                 "Gmail account has no saved history cursor; cannot safely process notification."
@@ -1418,6 +1433,7 @@ def process_realtime_email_update(
             if refreshed_refresh_token and refreshed_refresh_token.strip():
                 refresh_token = refreshed_refresh_token
 
+        stage = "token_refresh"
         _, active_token, token_expiry = get_gmail_service_with_token_state(
             access_token,
             refresh_token,
@@ -1426,6 +1442,12 @@ def process_realtime_email_update(
             on_token_refresh=persist_refreshed_token,
         )
         try:
+            stage = "history_fetch"
+            logger.info(
+                "HISTORY_FETCH_STARTED user_id=%s start_history_id=%s",
+                user_id,
+                start_id,
+            )
             new_ids, latest_id, active_token = fetch_new_message_ids_from_history(
                 access_token=active_token,
                 start_history_id=start_id,
@@ -1434,8 +1456,24 @@ def process_realtime_email_update(
                 token_expiry=token_state["expiry"],
                 on_token_refresh=persist_refreshed_token,
             )
+            logger.info(
+                "HISTORY_FETCH_COMPLETED user_id=%s message_count=%s "
+                "latest_history_id=%s",
+                user_id,
+                len(new_ids),
+                latest_id,
+            )
             fetched_emails = []
-            for msg_id in new_ids:
+            stage = "message_fetch"
+            message_count = len(new_ids)
+            for message_index, msg_id in enumerate(new_ids, start=1):
+                logger.info(
+                    "MESSAGE_FETCH_STARTED user_id=%s message_index=%s "
+                    "message_count=%s",
+                    user_id,
+                    message_index,
+                    message_count,
+                )
                 email_data = fetch_single_email(
                     access_token=active_token,
                     message_id=msg_id,
@@ -1445,8 +1483,16 @@ def process_realtime_email_update(
                 )
                 active_token = email_data.get("access_token", active_token)
                 fetched_emails.append(email_data)
+                logger.info(
+                    "MESSAGE_FETCH_COMPLETED user_id=%s message_index=%s "
+                    "in_inbox=%s",
+                    user_id,
+                    message_index,
+                    "INBOX" in email_data.get("label_ids", []),
+                )
             watch_expiration = None
         except GmailHistoryCursorExpired:
+            stage = "history_recovery"
             (
                 fetched_emails,
                 latest_id,
@@ -1459,7 +1505,15 @@ def process_realtime_email_update(
                 on_token_refresh=persist_refreshed_token,
             )
             token_state["access_token"] = active_token
+            logger.info(
+                "HISTORY_FETCH_COMPLETED user_id=%s message_count=%s "
+                "latest_history_id=%s recovery=true",
+                user_id,
+                len(fetched_emails),
+                latest_id,
+            )
 
+        stage = "email_persist"
         db = SessionLocal()
         try:
             user = (
@@ -1481,20 +1535,42 @@ def process_realtime_email_update(
                 )
                 db.rollback()
                 return
+            logger.info(
+                "EMAIL_PERSIST_STARTED user_id=%s message_count=%s",
+                user_id,
+                len(fetched_emails),
+            )
+            inserted_count = 0
+            updated_count = 0
+            skipped_count = 0
             for email_data in fetched_emails:
+                if "INBOX" not in email_data.get("label_ids", []):
+                    skipped_count += 1
+                    continue
                 if watch_expiration is not None:
-                    _upsert_recovered_email(db, user, email_data)
+                    result = _upsert_recovered_email(db, user, email_data)
+                    if result == "inserted":
+                        inserted_count += 1
+                    elif result == "updated":
+                        updated_count += 1
+                    else:
+                        skipped_count += 1
                 else:
-                    _store_email_if_new(db, user, email_data)
+                    if _store_email_if_new(db, user, email_data):
+                        inserted_count += 1
+                    else:
+                        skipped_count += 1
             user.access_token = active_token
             user.token_expiry = token_state["expiry"]
-            user.last_history_id = (
+            persisted_history_id = (
                 _latest_history_id(user.last_history_id, latest_id)
                 or start_id
             )
+            user.last_history_id = persisted_history_id
             if watch_expiration is not None:
                 user.watch_expiration = watch_expiration
             user.incremental_sync_status = "completed"
+            stage = "database_commit"
             db.commit()
         except Exception:
             db.rollback()
@@ -1503,10 +1579,18 @@ def process_realtime_email_update(
             db.close()
 
         logger.info(
-            "Ingested %d new email(s) for %s up to historyId %s",
-            len(fetched_emails),
-            email_address,
-            latest_id,
+            "EMAIL_PERSIST_COMPLETED user_id=%s inserted=%s updated=%s skipped=%s",
+            user_id,
+            inserted_count,
+            updated_count,
+            skipped_count,
+        )
+        logger.info(
+            "HISTORY_CURSOR_UPDATED user_id=%s previous_history_id=%s "
+            "history_id=%s",
+            user_id,
+            start_id,
+            persisted_history_id,
         )
         try:
             _enqueue_recent_email_tagging(user_id)
@@ -1514,7 +1598,15 @@ def process_realtime_email_update(
             logger.exception(
                 "Failed scheduling post-sync email tagging for user_id=%s", user_id
             )
-    except Exception:
+    except Exception as error:
+        logger.error(
+            "REALTIME_SYNC_FAILED stage=%s user_id=%s execution_id=%s "
+            "exception_type=%s",
+            stage,
+            user_id,
+            execution_id,
+            type(error).__name__,
+        )
         if user_id is not None:
             try:
                 _set_incremental_sync_status(
@@ -1535,7 +1627,7 @@ def _upsert_recovered_email(
     db: Session,
     user: UserAccount,
     email_data: dict,
-) -> None:
+) -> str:
     email_values = {
         "id": email_data["id"],
         "thread_id": email_data["thread_id"],
@@ -1549,6 +1641,13 @@ def _upsert_recovered_email(
         "created_at": email_data["received_at"],
         "is_read": bool(email_data.get("is_read", False)),
     }
+    existing = db.query(Email).filter(Email.id == email_data["id"]).first()
+    if existing is not None and existing.user_id != user.id:
+        logger.error(
+            "Gmail message ID collision across accounts; refusing recovery update"
+        )
+        return "skipped"
+
     if db.get_bind().dialect.name == "postgresql":
         inserted = db.execute(
             postgresql_insert(Email)
@@ -1564,12 +1663,7 @@ def _upsert_recovered_email(
             )
         )
         if not inserted.rowcount:
-            existing = db.query(Email).filter(Email.id == email_data["id"]).first()
-            if existing and existing.user_id != user.id:
-                logger.error(
-                    "Gmail message ID collision across accounts; refusing recovery update"
-                )
-            return
+            return "skipped"
         db.execute(
             postgresql_insert(EmailAgentStateModel)
             .values(
@@ -1580,21 +1674,15 @@ def _upsert_recovered_email(
             )
             .on_conflict_do_nothing(index_elements=[EmailAgentStateModel.email_id])
         )
-        return
+        return "updated" if existing is not None else "inserted"
 
-    existing = db.query(Email).filter(Email.id == email_data["id"]).first()
     if existing is not None:
-        if existing.user_id != user.id:
-            logger.error(
-                "Gmail message ID collision across accounts; refusing recovery update"
-            )
-            return
         for key, value in email_values.items():
             if key not in ("id", "user_id"):
                 setattr(existing, key, value)
-        return
+        return "updated"
 
-    _store_email_if_new(db, user, email_data)
+    return "inserted" if _store_email_if_new(db, user, email_data) else "skipped"
 
 
 def _recover_expired_gmail_history(
@@ -1636,7 +1724,13 @@ def _recover_expired_gmail_history(
         ],
     )
     fetched_emails = []
-    for message_id in dict.fromkeys([*current_ids, *changed_ids]):
+    message_ids = list(dict.fromkeys([*current_ids, *changed_ids]))
+    for message_index, message_id in enumerate(message_ids, start=1):
+        logger.info(
+            "MESSAGE_FETCH_STARTED stage=recovery message_index=%s message_count=%s",
+            message_index,
+            len(message_ids),
+        )
         email_data = fetch_single_email(
             access_token=active_token,
             message_id=message_id,
@@ -1646,6 +1740,11 @@ def _recover_expired_gmail_history(
         )
         active_token = email_data.get("access_token", active_token)
         fetched_emails.append(email_data)
+        logger.info(
+            "MESSAGE_FETCH_COMPLETED stage=recovery message_index=%s in_inbox=%s",
+            message_index,
+            "INBOX" in email_data.get("label_ids", []),
+        )
     return fetched_emails, latest_id, active_token, str(expiration)
 
 
@@ -1704,6 +1803,10 @@ def gmail_pubsub_webhook(req: PubSubPushRequest):
             detail="Malformed Gmail notification.",
         ) from exc
 
+    logger.info(
+        "PUBSUB_NOTIFICATION_RECEIVED history_id=%s",
+        history_id,
+    )
     lookup_db: Session = SessionLocal()
     try:
         user = (
@@ -1711,21 +1814,54 @@ def gmail_pubsub_webhook(req: PubSubPushRequest):
             .filter(func.lower(UserAccount.email) == email_address.lower())
             .first()
         )
-        if user is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Gmail account is not available; retry the notification.",
-            )
-        user_id = user.id
-        last_history_id = user.last_history_id
+    except Exception as error:
+        logger.error(
+            "REALTIME_SYNC_FAILED stage=pubsub_account_lookup "
+            "exception_type=%s",
+            type(error).__name__,
+        )
+        raise
     finally:
         lookup_db.close()
 
+    if user is None:
+        logger.warning(
+            "REALTIME_SYNC_FAILED stage=pubsub_account_lookup "
+            "exception_type=AccountNotFound"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Gmail account is not available; retry the notification.",
+        )
+    user_id = user.id
+    last_history_id = user.last_history_id
+
     if last_history_id and int(history_id) <= int(last_history_id):
+        logger.info(
+            "PUBSUB_NOTIFICATION_ACKNOWLEDGED history_id=%s reason=already_processed",
+            history_id,
+        )
         return Response(status_code=204)
 
     execution_id = pubsub_execution_id(email_address, str(history_id))
-    if not _claim_incremental_sync(user_id, execution_id):
+    try:
+        claimed = _claim_incremental_sync(user_id, execution_id)
+    except Exception as error:
+        logger.error(
+            "REALTIME_SYNC_FAILED stage=incremental_sync_claim user_id=%s "
+            "execution_id=%s exception_type=%s",
+            user_id,
+            execution_id,
+            type(error).__name__,
+        )
+        raise
+    if not claimed:
+        logger.warning(
+            "REALTIME_SYNC_FAILED stage=incremental_sync_claim user_id=%s "
+            "execution_id=%s exception_type=SyncAlreadyClaimed",
+            user_id,
+            execution_id,
+        )
         raise HTTPException(
             status_code=503,
             detail="Gmail account is not available; retry the notification.",
@@ -1748,12 +1884,24 @@ def gmail_pubsub_webhook(req: PubSubPushRequest):
                 "Could not record Pub/Sub queue failure for user_id=%s",
                 user_id,
             )
-        logger.exception("Failed to enqueue Gmail Pub/Sub notification")
+        logger.error(
+            "REALTIME_SYNC_FAILED stage=queue_enqueue user_id=%s "
+            "execution_id=%s exception_type=%s",
+            user_id,
+            execution_id,
+            type(error).__name__,
+        )
         raise HTTPException(
             status_code=503,
             detail="Gmail synchronization queue is unavailable; retry the delivery.",
         ) from error
 
+    logger.info(
+        "PUBSUB_NOTIFICATION_ENQUEUED user_id=%s execution_id=%s history_id=%s",
+        user_id,
+        execution_id,
+        history_id,
+    )
     return Response(status_code=204)
 
 

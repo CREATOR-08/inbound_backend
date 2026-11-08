@@ -155,6 +155,32 @@ class GmailCredentialTests(unittest.TestCase):
             "next-page",
         )
 
+    def test_history_message_without_label_ids_is_fetched_for_inbox_validation(self):
+        service = MagicMock()
+        history_list = service.users.return_value.history.return_value.list
+        history_list.return_value.execute.return_value = {
+            "historyId": "456",
+            "history": [
+                {
+                    "messagesAdded": [
+                        {"message": {"id": "message-labels-omitted"}}
+                    ]
+                }
+            ],
+        }
+
+        with patch.object(
+            gmail,
+            "get_gmail_service_from_token",
+            return_value=(service, "access-token"),
+        ):
+            result = gmail.fetch_new_message_ids_from_history(
+                access_token="access-token",
+                start_history_id="123",
+            )
+
+        self.assertEqual(result, (["message-labels-omitted"], "456", "access-token"))
+
     def test_credentials_include_refresh_configuration_and_account_expiry(self):
         expiry = datetime.now(timezone.utc) + timedelta(minutes=30)
         credentials = MagicMock()

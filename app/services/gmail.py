@@ -386,8 +386,13 @@ def fetch_new_message_ids_from_history(
             for record in resp.get("history", []):
                 for added in record.get("messagesAdded", []):
                     msg = added.get("message", {})
-                    if "INBOX" in msg.get("labelIds", []):
-                        new_ids.add(msg["id"])
+                    message_id = msg.get("id")
+                    message_labels = msg.get("labelIds")
+                    if message_id and (
+                        not isinstance(message_labels, list)
+                        or "INBOX" in message_labels
+                    ):
+                        new_ids.add(message_id)
                 for change_key in ("labelsAdded", "labelsRemoved"):
                     for change in record.get(change_key, []):
                         msg = change.get("message", {})
@@ -531,7 +536,9 @@ def fetch_single_email(
         except (TypeError, ValueError, OverflowError):
             received_at = datetime.now(timezone.utc)
 
-    labels = message.get("labelIds", [])
+    labels = message.get("labelIds")
+    if not isinstance(labels, list):
+        raise ValueError("Gmail message response is missing labelIds.")
     is_read = "UNREAD" not in labels
 
     return {
@@ -546,6 +553,7 @@ def fetch_single_email(
         "received_at": received_at,
         "access_token": active_token,
         "is_read": is_read,
+        "label_ids": labels,
     }
 
 

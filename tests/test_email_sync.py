@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -10,9 +11,14 @@ from unittest.mock import ANY, patch
 
 from fastapi import BackgroundTasks, HTTPException, Response
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.engine import make_url
+from sqlalchemy.orm import sessionmaker
 
 from app.api.routes import emails
 from app.api.schemas.schemas import PubSubPushRequest
+from app.db.database import DATABASE_URL
+from app.db.models import Email, EmailAgentStateModel, UserAccount
 from app.services.gmail import GmailHistoryCursorExpired
 
 
@@ -208,7 +214,10 @@ class InitialEmailSyncEndpointTests(unittest.TestCase):
                 "fetch_single_email",
                 side_effect=RuntimeError("Gmail API unavailable"),
             ),
-            patch.object(emails, "tag_recent_untagged_emails") as tag_emails,
+            patch.object(
+                emails,
+                "_enqueue_recent_email_tagging",
+            ) as tag_emails,
             self.assertRaisesRegex(RuntimeError, "Gmail API unavailable"),
         ):
             emails.run_initial_gmail_sync(user.id)
@@ -453,6 +462,7 @@ class InitialEmailSyncEndpointTests(unittest.TestCase):
             "body_html": "",
             "has_html": False,
             "received_at": None,
+            "label_ids": ["INBOX"],
         }
         with (
             patch.object(emails, "SessionLocal", side_effect=create_worker_database),
@@ -464,7 +474,10 @@ class InitialEmailSyncEndpointTests(unittest.TestCase):
             ),
             patch.object(emails, "fetch_single_email", return_value=message),
             patch.object(emails, "_store_initial_emails", return_value=1),
-            patch.object(emails, "tag_recent_untagged_emails") as tag_emails,
+            patch.object(
+                emails,
+                "_enqueue_recent_email_tagging",
+            ) as tag_emails,
         ):
             started = time.perf_counter()
             emails.run_initial_gmail_sync(user.id)
@@ -695,6 +708,86 @@ class InitialEmailSyncEndpointTests(unittest.TestCase):
 
 
 class GmailPubSubWebhookTests(unittest.TestCase):
+    def test_new_realtime_message_is_persisted_with_account_association(self):
+        engine = create_engine("sqlite:///:memory:")
+        UserAccount.__table__.create(engine)
+        Email.__table__.create(engine)
+        EmailAgentStateModel.__table__.create(engine)
+        database_factory = sessionmaker(bind=engine, expire_on_commit=False)
+        setup_db = database_factory()
+        setup_db.add(
+            UserAccount(
+                id="user-1",
+                email="user@example.com",
+                access_token="access-token",
+                refresh_token="refresh-token",
+                last_history_id="123",
+            )
+        )
+        setup_db.commit()
+        setup_db.close()
+
+        message = {
+            "id": "new-message-1",
+            "thread_id": "thread-1",
+            "sender": "sender@example.com",
+            "subject": "New message",
+            "preview": "Preview",
+            "body": "Body",
+            "body_html": "<p>Body</p>",
+            "has_html": True,
+            "received_at": datetime(2026, 11, 8, tzinfo=timezone.utc),
+            "access_token": "access-token",
+            "is_read": False,
+            "label_ids": ["INBOX", "UNREAD"],
+        }
+
+        try:
+            with (
+                patch.object(emails, "SessionLocal", side_effect=database_factory),
+                patch.object(
+                    emails,
+                    "get_gmail_service_with_token_state",
+                    return_value=(None, "access-token", None),
+                ),
+                patch.object(
+                    emails,
+                    "fetch_new_message_ids_from_history",
+                    return_value=(["new-message-1"], "456", "access-token"),
+                ),
+                patch.object(emails, "fetch_single_email", return_value=message),
+                patch.object(emails, "_enqueue_recent_email_tagging"),
+                self.assertLogs(emails.logger, level="INFO") as captured,
+            ):
+                emails.process_realtime_email_update("user@example.com", "456")
+
+            verify_db = database_factory()
+            stored_email = verify_db.query(Email).filter(
+                Email.id == "new-message-1"
+            ).one()
+            stored_user = verify_db.query(UserAccount).filter(
+                UserAccount.id == "user-1"
+            ).one()
+            email_state = verify_db.query(EmailAgentStateModel).filter(
+                EmailAgentStateModel.email_id == "new-message-1"
+            ).one()
+            self.assertEqual(stored_email.user_id, stored_user.id)
+            self.assertEqual(stored_email.subject, "New message")
+            self.assertFalse(stored_email.is_read)
+            self.assertEqual(email_state.email_id, stored_email.id)
+            self.assertEqual(stored_user.last_history_id, "456")
+            log_output = "\n".join(captured.output)
+            self.assertIn("EMAIL_PERSIST_COMPLETED", log_output)
+            self.assertIn("inserted=1 updated=0 skipped=0", log_output)
+            self.assertIn("HISTORY_CURSOR_UPDATED", log_output)
+            self.assertLess(
+                log_output.index("EMAIL_PERSIST_COMPLETED"),
+                log_output.index("HISTORY_CURSOR_UPDATED"),
+            )
+            verify_db.close()
+        finally:
+            engine.dispose()
+
     def test_expired_history_uses_full_inbox_recovery_not_three_day_import(self):
         user = _sync_user(status="completed")
         database = FakeDatabase(user)
@@ -708,6 +801,7 @@ class GmailPubSubWebhookTests(unittest.TestCase):
             "body_html": "",
             "has_html": False,
             "received_at": None,
+            "label_ids": ["INBOX"],
         }
 
         with (
@@ -853,6 +947,7 @@ class GmailPubSubWebhookTests(unittest.TestCase):
             "body_html": "",
             "has_html": False,
             "received_at": None,
+            "label_ids": ["INBOX"],
         }
 
         with (
@@ -906,6 +1001,51 @@ class GmailPubSubWebhookTests(unittest.TestCase):
 
         self.assertEqual(user.last_history_id, "123")
         self.assertEqual(user.incremental_sync_status, "failed")
+
+    def test_cursor_does_not_advance_when_email_persistence_fails(self):
+        user = _sync_user(status="completed")
+        database = FakeDatabase(user)
+        message = {
+            "id": "message-1",
+            "thread_id": "thread-1",
+            "sender": "sender@example.com",
+            "subject": "Subject",
+            "preview": "Preview",
+            "body": "Body",
+            "body_html": "",
+            "has_html": False,
+            "received_at": None,
+            "label_ids": ["INBOX"],
+        }
+
+        with (
+            patch.object(emails, "SessionLocal", return_value=database),
+            patch.object(
+                emails,
+                "get_gmail_service_with_token_state",
+                return_value=(None, "access-token", None),
+            ),
+            patch.object(
+                emails,
+                "fetch_new_message_ids_from_history",
+                return_value=(["message-1"], "456", "access-token"),
+            ),
+            patch.object(emails, "fetch_single_email", return_value=message),
+            patch.object(
+                emails,
+                "_store_email_if_new",
+                side_effect=RuntimeError("database insert failed"),
+            ),
+            patch.object(emails, "_set_incremental_sync_status") as set_status,
+            self.assertLogs(emails.logger, level="ERROR") as captured,
+            self.assertRaisesRegex(RuntimeError, "database insert failed"),
+        ):
+            emails.process_realtime_email_update("user@example.com", "456")
+
+        self.assertEqual(user.last_history_id, "123")
+        self.assertTrue(database.commits >= 1)
+        self.assertEqual(set_status.call_args.args[1], "failed")
+        self.assertIn("REALTIME_SYNC_FAILED stage=email_persist", captured.output[0])
 
     def test_concurrent_cursor_advance_is_not_overwritten_by_stale_history(self):
         user = _sync_user(status="completed")
@@ -1027,24 +1167,33 @@ class GmailPubSubWebhookTests(unittest.TestCase):
         request = _pubsub_request(
             {"emailAddress": "user@example.com", "historyId": "12345"}
         )
+        user = _sync_user(status="completed")
 
-        with patch.object(emails, "process_realtime_email_update") as process:
+        with (
+            patch.object(emails, "SessionLocal", return_value=FakeDatabase(user)),
+            patch.object(emails, "_claim_incremental_sync", return_value=True),
+            patch.object(emails, "enqueue_job") as enqueue,
+        ):
             response = emails.gmail_pubsub_webhook(request)
 
-        process.assert_called_once_with("user@example.com", "12345")
+        enqueue.assert_called_once()
         self.assertEqual(response.status_code, 204)
 
-    def test_returns_retryable_error_when_processing_fails(self):
+    def test_returns_retryable_error_when_queue_is_unavailable(self):
         request = _pubsub_request(
             {"emailAddress": "user@example.com", "historyId": "12345"}
         )
+        user = _sync_user(status="completed")
 
         with (
+            patch.object(emails, "SessionLocal", return_value=FakeDatabase(user)),
+            patch.object(emails, "_claim_incremental_sync", return_value=True),
             patch.object(
                 emails,
-                "process_realtime_email_update",
-                side_effect=RuntimeError("Gmail API unavailable"),
+                "enqueue_job",
+                side_effect=emails.QueueUnavailableError("Redis unavailable"),
             ),
+            patch.object(emails, "_set_incremental_sync_status"),
             self.assertRaises(HTTPException) as error,
         ):
             emails.gmail_pubsub_webhook(request)
@@ -1058,6 +1207,154 @@ class GmailPubSubWebhookTests(unittest.TestCase):
             emails.gmail_pubsub_webhook(request)
 
         self.assertEqual(error.exception.status_code, 400)
+
+
+@unittest.skipUnless(
+    os.getenv("TEST_DATABASE_URL"),
+    "Set TEST_DATABASE_URL to run the PostgreSQL persistence integration test.",
+)
+class PostgreSQLRealtimeEmailPersistenceTests(unittest.TestCase):
+    def test_new_realtime_message_is_persisted_in_postgresql(self):
+        database_url = os.environ["TEST_DATABASE_URL"]
+        test_url = make_url(database_url)
+        production_url = make_url(DATABASE_URL)
+        if (
+            test_url.host == production_url.host
+            and test_url.database == production_url.database
+        ):
+            self.fail("TEST_DATABASE_URL must not point at the production database.")
+        if test_url.get_backend_name() != "postgresql":
+            self.fail("TEST_DATABASE_URL must use PostgreSQL.")
+        if database_url.startswith("postgres://"):
+            database_url = database_url.replace(
+                "postgres://", "postgresql+psycopg://", 1
+            )
+        elif database_url.startswith("postgresql://"):
+            database_url = database_url.replace(
+                "postgresql://", "postgresql+psycopg://", 1
+            )
+
+        engine = create_engine(database_url)
+        connection = engine.connect()
+        transaction = connection.begin()
+        try:
+            connection.exec_driver_sql(
+                """
+                CREATE TEMP TABLE user_accounts (
+                    id VARCHAR PRIMARY KEY,
+                    email VARCHAR NOT NULL UNIQUE,
+                    access_token TEXT,
+                    refresh_token TEXT,
+                    token_expiry TIMESTAMPTZ,
+                    last_history_id VARCHAR(64),
+                    watch_expiration VARCHAR(64),
+                    initial_sync_status VARCHAR(16),
+                    initial_sync_completed_at TIMESTAMPTZ,
+                    initial_sync_eligible BOOLEAN NOT NULL DEFAULT FALSE,
+                    incremental_sync_status VARCHAR(16),
+                    incremental_sync_id VARCHAR(36),
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    updated_at TIMESTAMPTZ
+                )
+                """
+            )
+            connection.exec_driver_sql(
+                """
+                CREATE TEMP TABLE emails (
+                    id VARCHAR PRIMARY KEY,
+                    thread_id VARCHAR,
+                    user_id VARCHAR REFERENCES user_accounts(id) ON DELETE CASCADE,
+                    sender VARCHAR NOT NULL,
+                    subject VARCHAR NOT NULL,
+                    preview TEXT,
+                    body TEXT,
+                    body_html TEXT,
+                    has_html BOOLEAN,
+                    category VARCHAR,
+                    priority VARCHAR,
+                    is_archived BOOLEAN,
+                    is_read BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ DEFAULT now()
+                )
+                """
+            )
+            connection.exec_driver_sql(
+                """
+                CREATE TEMP TABLE email_agent_states (
+                    id UUID PRIMARY KEY,
+                    email_id VARCHAR(64) NOT NULL UNIQUE
+                        REFERENCES emails(id) ON DELETE CASCADE,
+                    category VARCHAR(32),
+                    priority VARCHAR(16),
+                    reply_outline JSON,
+                    suggested_reply TEXT,
+                    is_archived BOOLEAN,
+                    created_at TIMESTAMPTZ DEFAULT now()
+                )
+                """
+            )
+            connection.exec_driver_sql(
+                """
+                INSERT INTO user_accounts
+                    (id, email, access_token, refresh_token, last_history_id)
+                VALUES
+                    ('user-1', 'user@example.com', 'test-access-token',
+                     'test-refresh-token', '123')
+                """
+            )
+            database_factory = sessionmaker(
+                bind=connection,
+                expire_on_commit=False,
+                join_transaction_mode="create_savepoint",
+            )
+            message = {
+                "id": "new-message-1",
+                "thread_id": "thread-1",
+                "sender": "sender@example.com",
+                "subject": "New message",
+                "preview": "Preview",
+                "body": "Body",
+                "body_html": "<p>Body</p>",
+                "has_html": True,
+                "received_at": datetime(2026, 11, 8, tzinfo=timezone.utc),
+                "access_token": "test-access-token",
+                "is_read": False,
+                "label_ids": ["INBOX", "UNREAD"],
+            }
+
+            with (
+                patch.object(emails, "SessionLocal", side_effect=database_factory),
+                patch.object(
+                    emails,
+                    "get_gmail_service_with_token_state",
+                    return_value=(None, "test-access-token", None),
+                ),
+                patch.object(
+                    emails,
+                    "fetch_new_message_ids_from_history",
+                    return_value=(["new-message-1"], "456", "test-access-token"),
+                ),
+                patch.object(emails, "fetch_single_email", return_value=message),
+                patch.object(emails, "_enqueue_recent_email_tagging"),
+            ):
+                emails.process_realtime_email_update("user@example.com", "456")
+
+            verify_db = database_factory()
+            stored_email = verify_db.query(Email).filter(
+                Email.id == "new-message-1"
+            ).one()
+            stored_user = verify_db.query(UserAccount).filter(
+                UserAccount.id == "user-1"
+            ).one()
+            self.assertEqual(stored_email.user_id, stored_user.id)
+            self.assertEqual(stored_email.subject, "New message")
+            self.assertFalse(stored_email.is_read)
+            self.assertEqual(stored_user.last_history_id, "456")
+            verify_db.close()
+        finally:
+            transaction.rollback()
+            connection.close()
+            engine.dispose()
 
 
 if __name__ == "__main__":

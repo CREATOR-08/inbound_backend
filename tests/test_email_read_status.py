@@ -126,10 +126,12 @@ class EmailReadStatusTests(unittest.TestCase):
 
         self.assertFalse(result_unread["is_read"])
         self.assertTrue(result_read["is_read"])
+        self.assertEqual(result_unread["label_ids"], ["INBOX", "UNREAD"])
 
     def test_fetch_single_email_uses_configured_google_api_retries(self):
         message = {
             "id": "message-1",
+            "labelIds": ["INBOX"],
             "payload": {"headers": [], "body": {"data": ""}},
             "snippet": "Snippet",
         }
