@@ -177,8 +177,14 @@ class PlannedUIAction(BaseModel):
 WorkflowTool = Literal[
     "search_emails",
     "read_email",
+    "summarize_email",
+    "triage_email",
     "draft_email",
     "send_email_reply",
+    "mark_email_read",
+    "mark_email_unread",
+    "archive_emails",
+    "schedule_event",
     "unknown",
 ]
 
@@ -196,14 +202,65 @@ class WorkflowStep(BaseModel):
             if set(self.parameters) != {"query"}:
                 raise ValueError("search_emails requires only a query specification.")
             EmailQuerySpec.model_validate(self.parameters["query"])
-        elif self.tool in {"read_email", "draft_email"}:
-            if set(self.parameters) - {"email_id"}:
-                raise ValueError(f"{self.tool} accepts only email_id.")
+        elif self.tool in {
+            "read_email",
+            "summarize_email",
+            "triage_email",
+            "draft_email",
+            "mark_email_read",
+            "mark_email_unread",
+            "schedule_event",
+        }:
+            allowed = {"email_id"}
+            if self.tool == "draft_email":
+                allowed.add("instructions")
+            if set(self.parameters) - allowed:
+                raise ValueError(f"{self.tool} has unsupported parameters.")
             email_id = self.parameters.get("email_id")
             if email_id is not None and (
                 not isinstance(email_id, str) or not email_id or len(email_id) > 500
             ):
                 raise ValueError(f"{self.tool} requires a valid email_id.")
+            instructions = self.parameters.get("instructions")
+            if instructions is not None and (
+                not isinstance(instructions, str)
+                or not instructions.strip()
+                or len(instructions) > 1_000
+            ):
+                raise ValueError("Draft instructions must contain 1 to 1000 characters.")
+        elif self.tool == "archive_emails":
+            if set(self.parameters) == {"from_search"}:
+                if self.parameters["from_search"] is not True:
+                    raise ValueError("from_search must be true.")
+            elif set(self.parameters) == {"email_id"}:
+                email_id = self.parameters["email_id"]
+                if (
+                    not isinstance(email_id, str)
+                    or not email_id
+                    or len(email_id) > 500
+                ):
+                    raise ValueError("archive_emails requires a valid email_id.")
+            elif set(self.parameters) == {"email_ids"}:
+                email_ids = self.parameters["email_ids"]
+                if (
+                    not isinstance(email_ids, list)
+                    or not 1 <= len(email_ids) <= 50
+                    or not all(
+                        isinstance(email_id, str)
+                        and email_id
+                        and len(email_id) <= 500
+                        for email_id in email_ids
+                    )
+                ):
+                    raise ValueError(
+                        "archive_emails requires 1 to 50 unique valid email IDs."
+                    )
+                if len(set(email_ids)) != len(email_ids):
+                    raise ValueError("archive_emails does not accept duplicate IDs.")
+            else:
+                raise ValueError(
+                    "archive_emails requires email_id, email_ids, or from_search."
+                )
         elif self.tool == "send_email_reply":
             if set(self.parameters) - {"email_id", "body"}:
                 raise ValueError("send_email_reply accepts only email_id and body.")
@@ -214,9 +271,12 @@ class WorkflowStep(BaseModel):
             ):
                 raise ValueError("send_email_reply requires a valid email_id.")
             if (
-                not isinstance(body, str) or not body.strip() or len(body) > 12_000
+                body is not None
+                and (
+                    not isinstance(body, str) or not body.strip() or len(body) > 12_000
+                )
             ):
-                raise ValueError("send_email_reply requires a valid reply body.")
+                raise ValueError("send_email_reply body must contain up to 12000 characters.")
         elif self.parameters:
             raise ValueError("unknown does not accept parameters.")
         return self

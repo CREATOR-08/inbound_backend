@@ -600,6 +600,40 @@ def update_gmail_message_read_status(
         raise
 
 
+def archive_gmail_message(
+    access_token: str,
+    message_id: str,
+    refresh_token: Optional[str] = None,
+    token_expiry: Optional[datetime] = None,
+    on_token_refresh: Optional[TokenRefreshCallback] = None,
+) -> Dict[str, Any]:
+    """Remove a message from Gmail's inbox using the user's existing credentials."""
+    service, active_token = get_gmail_service_from_token(
+        access_token, refresh_token, token_expiry, on_token_refresh
+    )
+    try:
+        return (
+            service.users()
+            .messages()
+            .modify(
+                userId="me",
+                id=message_id,
+                body={"removeLabelIds": ["INBOX"]},
+            )
+            .execute()
+        )
+    except HttpError as exc:
+        _invalidate_profile_cache_after_google_error(
+            exc, access_token, active_token
+        )
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        if status == 401 and not refresh_token:
+            raise GmailReauthorizationRequired(
+                "Reconnect your Google account to restore Gmail synchronization."
+            ) from exc
+        raise
+
+
 # =========================================================================
 # Reply Operations
 # =========================================================================

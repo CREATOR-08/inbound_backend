@@ -1,16 +1,23 @@
 """Allow-listed, user-scoped SQLAlchemy queries used by the assistant."""
 
+import logging
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from sqlalchemy import and_, func
 from sqlalchemy.orm import Session, aliased
 
+from app.api.dependencies import _persist_account_token_state
 from app.api.schemas.assistant import EmailFilter, EmailQuerySpec
 from app.db.database import SessionLocal
-from app.db.models import Email, EmailAgentStateModel
-from app.services.gmail import html_to_text
+from app.db.models import Email, EmailAgentStateModel, UserAccount
+from app.services.gmail import (
+    GmailReauthorizationRequired,
+    archive_gmail_message,
+    html_to_text,
+)
 
+logger = logging.getLogger(__name__)
 SessionFactory = Callable[[], Session]
 
 
@@ -146,5 +153,103 @@ def get_email_for_user(
             "body": body[:12_000],
             "body_available": body_available,
         }
+    finally:
+        db.close()
+
+
+def archive_emails_for_user(user_id: str, email_ids: list[str]) -> dict[str, Any]:
+    """Archive validated user-owned emails in Gmail and synchronize local state."""
+    if not email_ids or len(email_ids) > 50 or len(set(email_ids)) != len(email_ids):
+        raise ValueError("Archive requires 1 to 50 unique email IDs.")
+
+    db = SessionLocal()
+    try:
+        emails = (
+            db.query(Email)
+            .filter(Email.user_id == user_id, Email.id.in_(email_ids))
+            .all()
+        )
+        emails_by_id = {email.id: email for email in emails}
+        missing_ids = [email_id for email_id in email_ids if email_id not in emails_by_id]
+        if missing_ids:
+            raise LookupError(
+                "One or more emails were not found in the authenticated account."
+            )
+
+        account = (
+            db.query(UserAccount)
+            .filter(UserAccount.id == user_id)
+            .first()
+        )
+        if account is None or not account.access_token:
+            raise RuntimeError("Gmail credentials are unavailable.")
+
+        token_state = {
+            "access_token": account.access_token,
+            "refresh_token": account.refresh_token,
+            "token_expiry": account.token_expiry,
+        }
+        archived_ids: list[str] = []
+        for index, email_id in enumerate(email_ids):
+            email = emails_by_id[email_id]
+
+            def persist_refreshed_state(
+                refreshed_access: str,
+                expiry: datetime | None,
+                refreshed_refresh: str | None,
+            ) -> None:
+                persisted = _persist_account_token_state(
+                    user_id,
+                    refreshed_access,
+                    expiry,
+                    refreshed_refresh,
+                    expected_access_token=token_state["access_token"],
+                )
+                if persisted:
+                    token_state["access_token"] = refreshed_access
+                    token_state["token_expiry"] = expiry
+                    if refreshed_refresh is not None:
+                        token_state["refresh_token"] = refreshed_refresh
+
+            try:
+                archive_gmail_message(
+                    access_token=token_state["access_token"],
+                    message_id=email_id,
+                    refresh_token=token_state["refresh_token"],
+                    token_expiry=token_state["token_expiry"],
+                    on_token_refresh=persist_refreshed_state,
+                )
+            except Exception as error:
+                db.rollback()
+                logger.exception("Failed archiving email_id=%s", email_id)
+                if isinstance(error, GmailReauthorizationRequired):
+                    error_message = (
+                        "Gmail access must be reauthorized. Reconnect your account."
+                    )
+                elif isinstance(error, (ValueError, LookupError)):
+                    error_message = str(error)[:300]
+                else:
+                    error_message = "Gmail could not archive this email."
+                return {
+                    "archived_email_ids": archived_ids,
+                    "failed_email_id": email_id,
+                    "message": error_message,
+                    "not_executed_email_ids": email_ids[index + 1 :],
+                }
+
+            email.is_archived = True
+            if email.state is not None:
+                email.state.is_archived = True
+            db.commit()
+            archived_ids.append(email_id)
+
+        return {
+            "archived_email_ids": archived_ids,
+            "failed_email_id": None,
+            "not_executed_email_ids": [],
+        }
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()

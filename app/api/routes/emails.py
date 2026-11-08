@@ -81,6 +81,7 @@ from app.services.gmail import (
     start_gmail_watch,
     update_gmail_message_read_status,
 )
+from app.services.email_mutations import set_email_read_status
 
 logger = logging.getLogger(__name__)
 
@@ -2066,30 +2067,9 @@ def _set_email_read_state(
     if not email:
         raise HTTPException(status_code=404, detail="Email not found")
 
-    original_is_read = bool(email.is_read)
-    email.is_read = is_read
-    db.commit()
-
     try:
-        update_gmail_message_read_status(
-            access_token=token,
-            message_id=email.id,
-            is_read=is_read,
-            refresh_token=user.refresh_token,
-            token_expiry=user.token_expiry,
-            on_token_refresh=lambda refreshed_access, expiry, refreshed_refresh: (
-                _persist_gmail_token_state(
-                    user.id,
-                    refreshed_access,
-                    expiry,
-                    refreshed_refresh,
-                    expected_access_token=token,
-                )
-            ),
-        )
+        return set_email_read_status(email, is_read, user, token, db)
     except GmailReauthorizationRequired as exc:
-        email.is_read = original_is_read
-        db.commit()
         raise HTTPException(
             status_code=401,
             detail=(
@@ -2098,8 +2078,6 @@ def _set_email_read_state(
             ),
         ) from exc
     except HttpError as exc:
-        email.is_read = original_is_read
-        db.commit()
         status = getattr(getattr(exc, "resp", None), "status", None)
         if status == 403:
             raise HTTPException(
@@ -2112,15 +2090,11 @@ def _set_email_read_state(
             detail="Unable to synchronize read status with Gmail. Please try again.",
         ) from exc
     except Exception as exc:
-        email.is_read = original_is_read
-        db.commit()
         logger.exception("Unable to update Gmail labels for email %s", email_id)
         raise HTTPException(
             status_code=502,
             detail="Unable to synchronize read status with Gmail. Please try again.",
         ) from exc
-
-    return email
 
 
 @router.get("/emails/{email_id}/body")

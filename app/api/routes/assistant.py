@@ -56,7 +56,10 @@ def _stream_assistant_response(input_state: dict[str, Any]) -> Iterator[str]:
         for mode, value in graph_stream:
             if mode == "messages":
                 chunk, metadata = value
-                if metadata.get("langgraph_node") != "answer_question":
+                if metadata.get("langgraph_node") not in {
+                    "answer_question",
+                    "execute_tools",
+                }:
                     continue
                 content = getattr(chunk, "content", "")
                 if isinstance(content, str) and content:

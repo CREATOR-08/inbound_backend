@@ -1,0 +1,14 @@
+
+#:schema https://openapi.vercel.sh/vercel.json
+
+[daemons.gmail-worker]
+root = "./"
+entrypoint = "Dockerfile"
+command = ["python", "-m", "app.worker.gmail"]
+instances.bom1 = 1
+
+[daemons.ai-worker]
+root = "./"
+entrypoint = "Dockerfile"
+command = ["python", "-m", "app.worker.ai"]
+instances.bom1 = 1

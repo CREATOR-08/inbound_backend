@@ -16,49 +16,27 @@ from app.api.schemas.schemas import CalendarApprovalRequest, EmailActionRequest
 from app.db.database import SessionLocal, get_db
 from app.db.models import CalendarDraft, Email
 from app.services.calendar import (
+    CalendarDraftAlreadyApprovedError,
+    _schedule_proposal_times as _validate_schedule_proposal_times,
     create_google_calendar_event,
     normalize_calendar_event_times,
+    save_calendar_draft,
 )
 from app.services.gmail import clean_text_for_llm, html_to_text
 
 logger = logging.getLogger(__name__)
 action_router = APIRouter()
 
-SCHEDULE_AMBIGUITY_MESSAGE = (
-    "The email does not provide complete, unambiguous event times. "
-    "Enter the start and end times manually to continue."
-)
+def _schedule_proposal_times(
+    event: dict,
+) -> tuple[str, str, float, str | None]:
+    return _validate_schedule_proposal_times(event)
+
 
 CALENDAR_PERMISSION_MESSAGE = (
     "Google Calendar permission is missing. "
     "Reconnect your Google account and grant Calendar access."
 )
-
-
-def _schedule_proposal_times(
-    event: dict,
-) -> tuple[str, str, float, str | None]:
-    """Validate and normalize proposed event times."""
-    extraction_status = event.get("extraction_status")
-    if extraction_status in {"missing", "ambiguous", "invalid"}:
-        message = event.get("ambiguity")
-        return "", "", 0.0, (
-            message
-            if isinstance(message, str) and message.strip()
-            else "Please provide a complete, unambiguous meeting date, time, and duration."
-        )
-
-    confidence = float(event.get("confidence", 0.0))
-
-    if confidence <= 0:
-        return "", "", confidence, SCHEDULE_AMBIGUITY_MESSAGE
-
-    start_time, end_time = normalize_calendar_event_times(
-        event["start_time"],
-        event["end_time"],
-    )
-
-    return start_time, end_time, confidence, None
 
 
 @action_router.post("/schedule")
@@ -127,91 +105,19 @@ def generate_schedule(
             detail="Unable to generate the meeting schedule. Please try again.",
         ) from exc
 
-    extraction_status = event.get("extraction_status", "complete")
     try:
-        start_time, end_time, confidence, ambiguity = (
-            _schedule_proposal_times(event)
+        return save_calendar_draft(
+            email_id,
+            user.id,
+            email_subject,
+            event,
         )
-
-    except (ValueError, KeyError, TypeError):
-        logger.warning(
-            "Schedule extraction returned invalid event data for email %s",
-            req.email_id,
-        )
-        start_time, end_time, confidence = "", "", 0.0
-        ambiguity = (
-            "I couldn't validate the extracted meeting date or time. "
-            "Please enter the date and time manually."
-        )
-        extraction_status = "invalid"
-    if confidence <= 0 and extraction_status == "complete":
-        extraction_status = "ambiguous"
-
-    draft_db = SessionLocal()
-
-    try:
-        draft = (
-            draft_db.query(CalendarDraft)
-            .join(Email, Email.id == CalendarDraft.email_id)
-            .filter(
-                CalendarDraft.email_id == email_id,
-                Email.user_id == user.id,
-            )
-            .first()
-        )
-
-        if draft and draft.status == "APPROVED":
-            raise HTTPException(
-                status_code=409,
-                detail="A calendar event has already been approved for this email.",
-            )
-
-        title = event.get("title") or email_subject or "Meeting"
-        attendees = event.get("attendees") or []
-
-        if draft is None:
-            draft = CalendarDraft(
-                email_id=email_id,
-                title=title,
-                start_time=start_time,
-                end_time=end_time,
-                attendees=attendees,
-                confidence=str(confidence),
-                status="PENDING",
-            )
-            draft_db.add(draft)
-        else:
-            draft.title = title
-            draft.start_time = start_time
-            draft.end_time = end_time
-            draft.attendees = attendees
-            draft.confidence = str(confidence)
-            draft.status = "PENDING"
-
-        draft_db.commit()
-        draft_db.refresh(draft)
-
-        return {
-            "confirmation_required": True,
-            "calendar_event": {
-                "draft_id": str(draft.id),
-                "title": draft.title,
-                "start_time": draft.start_time,
-                "end_time": draft.end_time,
-                "attendees": draft.attendees or [],
-                "confidence": float(draft.confidence or 0),
-                "ambiguity": ambiguity,
-                "extraction_status": extraction_status,
-                "status": draft.status,
-            },
-        }
-
-    except HTTPException:
-        draft_db.rollback()
-        raise
-
+    except CalendarDraftAlreadyApprovedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
     except Exception as exc:
-        draft_db.rollback()
         logger.exception(
             "Failed to save calendar draft for email %s",
             req.email_id,
@@ -220,9 +126,6 @@ def generate_schedule(
             status_code=500,
             detail="Unable to save the calendar proposal. Please try again.",
         ) from exc
-
-    finally:
-        draft_db.close()
 
 
 @action_router.post("/calendar/confirm")

@@ -10,6 +10,13 @@ Intent = Literal[
     "WORKFLOW",
     "CLARIFICATION",
 ]
+TaskIntent = Literal[
+    "EMAIL_OPERATIONS",
+    "SUMMARIZE_EMAIL",
+    "GENERATE_REPLY",
+    "SCHEDULE_EVENT",
+    "GENERAL_QUERY",
+]
 
 
 class AssistantState(TypedDict, total=False):
@@ -28,10 +35,14 @@ class AssistantState(TypedDict, total=False):
 
     # Graph routing and intermediate data
     intent: Intent
+    task_intent: TaskIntent
+    multi_step: bool
     intent_reason: str
     retrieved_context: dict[str, Any]
     action_plan: list[dict[str, Any]]
     workflow_plan: list[dict[str, Any]]
+    workflow_summary: str
+    workflow_results: list[dict[str, Any]]
     query_spec: dict[str, Any]
     execute_workflow: bool
 

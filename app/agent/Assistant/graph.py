@@ -29,6 +29,15 @@ def route_after_input(state: AssistantState) -> str:
 def route_after_classification(state: AssistantState) -> str:
     if state.get("error"):
         return "validate_response"
+    if state.get("multi_step"):
+        return "plan_workflow"
+    task_intent = state.get("task_intent")
+    if task_intent == "SUMMARIZE_EMAIL":
+        return "fetch_context"
+    if task_intent == "GENERATE_REPLY":
+        return "fetch_context"
+    if task_intent == "SCHEDULE_EVENT":
+        return "plan_workflow"
     return {
         "UI_ACTION": "plan_actions",
         "DATA_QUERY": "plan_data_query",

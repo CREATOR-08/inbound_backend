@@ -74,6 +74,11 @@ Confirmation uses the authenticated user's account and rechecks ownership of
 every email ID. Never infer confirmation from conversational text alone. The
 explicit boolean and validated plan are required.
 
+An archive request based on a search first returns the matching email IDs and
+an `approved_workflow` containing only the proposed archive step. Review those
+IDs, then resubmit that step with `confirm_workflow: true`. Completed search or
+analysis steps are not repeated when the archive approval is submitted.
+
 ## Response envelope
 
 ```json
@@ -270,10 +275,15 @@ populate local data.
   `OPEN_EMAIL`, `OPEN_COMPOSE`, `FILTER_EMAILS`, and `CLEAR_FILTERS` to existing
   Next.js navigation/state handlers. Never evaluate action text as code.
 - For `QUESTION`, render the grounded `message`; the backend retrieves the
-  selected email from the user's local database when the question refers to it.
+  selected email from the user's local database when the request refers to its
+  content.
 - For `WORKFLOW`, render each per-step result. Show a review/confirm UI before
   resubmitting `data.approved_workflow` with `confirm_workflow: true`. Sending
   a reply uses the existing Gmail reply service only after this confirmation.
+- A generated reply is returned as an `OPEN_COMPOSE` action for review; it is
+  not sent automatically. A calendar request creates a pending calendar draft
+  and returns its `draft_id`; create the Google Calendar event only through the
+  existing calendar confirmation endpoint after explicit user approval.
 - Render `requires_clarification` as a follow-up question and
   `requires_confirmation` as a confirmation prompt. Do not treat either as a
   completed operation.
@@ -289,14 +299,25 @@ populate local data.
   sender/subject/archive filters, stable ordering, and bounded pagination.
 - UI action proposals are allow-listed and parameter-validated. The frontend
   performs the actions; the backend never runs generated JavaScript.
-- Selected-email question context is loaded only when the question refers to
-  email content and the email belongs to the authenticated user.
+- Selected-email context is loaded only when the request refers to its content
+  or an email-detail operation, and only when the email belongs to the
+  authenticated user.
 - Workflows support local email search, reading a scoped email, drafting a
-  reply, and explicitly confirmed reply sending. Drafts open in the frontend
-  compose UI; they are not sent automatically.
-- Fetching new Gmail data, unread filtering, deleting email, and calendar-event
-  creation from assistant workflows are unsupported. Existing standalone Gmail
-  sync and calendar routes remain available.
+  reply, summary and triage, read/unread updates, scheduling proposals, archive,
+  and explicitly confirmed reply sending. Drafts open in the frontend compose
+  UI; they are not sent automatically. Archive and send operations require
+  explicit approval; archive also synchronizes the Gmail inbox label and local
+  archive state.
+- Multi-step workflow plans are validated to at most 10 allow-listed
+  operations. Steps execute sequentially, and email operations may consume the
+  most recent scoped search result. Search, summary, and draft results are
+  returned in `data.results`.
+- The assistant routes summary, reply, schedule, and general requests to the
+  corresponding existing workflows. Triage requests reuse the existing
+  classifier without automatically archiving or changing the email.
+- Fetching new Gmail data, unread filtering, and deleting email are
+  unsupported. Calendar proposals remain pending until confirmed through the
+  existing calendar confirmation route.
 - Gemini model names are configurable but have not been availability-checked
   through external API calls. Set `GEMINI_FAST_MODEL` and optionally
   `GEMINI_REASONING_MODEL` to model identifiers enabled for the deployment.
