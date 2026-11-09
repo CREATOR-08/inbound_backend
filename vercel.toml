@@ -14,3 +14,9 @@ root = "./"
 entrypoint = "Dockerfile"
 command = ["python", "-m", "app.worker.ai"]
 instances.bom1 = 1
+
+[daemons.rq-scheduler]
+root = "./"
+entrypoint = "Dockerfile"
+command = ["python", "-m", "app.worker.scheduler"]
+instances.bom1 = 1

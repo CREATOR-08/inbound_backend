@@ -15,5 +15,4 @@ redis_connection = redis.Redis.from_url(
     decode_responses=False,
     socket_connect_timeout=5,
     socket_timeout=5,
-    health_check_interval=30,
 )
