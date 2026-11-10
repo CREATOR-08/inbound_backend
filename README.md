@@ -5,7 +5,7 @@ AI-powered Gmail workspace with email synchronization, AI-assisted
 workflows, calendar integration, and a LangGraph-based assistant.
 
 > **Repository:** Backend\
-> **Frontend:** [Inbound AI Frontend](../inbound) --- replace this with
+> **Frontend:** [Inbound AI Frontend](https://github.com/CREATOR-08/inbound) --- replace this with
 > the actual frontend repository URL\
 > **Status:** Active development
 
